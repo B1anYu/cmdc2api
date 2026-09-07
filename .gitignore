@@ -1,0 +1,12 @@
+# 参考项目克隆（本地参考用，不入库）
+/reference/
+
+# Go 构建产物
+/bin/
+*.test
+*.out
+
+# 环境与密钥
+.env
+.env.*
+config.json
