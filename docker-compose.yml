@@ -1,0 +1,25 @@
+services:
+  cmdc2api:
+    image: ghcr.io/b1anyu/cmdc2api:latest
+    # 本地构建时改用：
+    # build: .
+    container_name: cmdc2api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3050:3050"
+    environment:
+      # 容器内必须绑 0.0.0.0（compose 已把宿主侧限制在 loopback）
+      HOST: 0.0.0.0
+      PORT: "3050"
+      # CMD_ZDR: "1"
+      # CC_SESSION_STRATEGY: prefix   # prefix（默认）| key（原版行为）
+      # CC_ASSISTANT_REASONING: "1"   # 实验开关，见 README
+    volumes:
+      - ./data:/data
+    # 接 axonhub：解开下行注释并确保该网络存在
+    # networks:
+    #   - axonhub_default
+
+# networks:
+#   axonhub_default:
+#     external: true
