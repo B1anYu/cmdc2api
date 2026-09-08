@@ -153,7 +153,7 @@ func TestEndToEnd_StreamHappyPath(t *testing.T) {
 	proxy := newProxy(t, f, nil)
 
 	resp := postMessages(t, proxy, anthropicReq, map[string]string{"x-api-key": "user_test123"})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -220,8 +220,8 @@ func TestEndToEnd_SessionAffinity(t *testing.T) {
 
 	// 同一对话两轮：首条用户消息不变 → 同一会话
 	post1 := postMessages(t, proxy, anthropicReq, map[string]string{"x-api-key": "user_test123"})
-	io.Copy(io.Discard, post1.Body)
-	post1.Body.Close()
+	_, _ = io.Copy(io.Discard, post1.Body)
+	_ = post1.Body.Close()
 	post2 := postMessages(t, proxy, `{
 		"model": "claude-sonnet-4-6", "max_tokens": 1024, "stream": true,
 		"system": [{"type": "text", "text": "You are a weather bot."}],
@@ -232,8 +232,8 @@ func TestEndToEnd_SessionAffinity(t *testing.T) {
 			{"role": "user", "content": "thanks"}
 		]
 	}`, map[string]string{"x-api-key": "user_test123"})
-	io.Copy(io.Discard, post2.Body)
-	post2.Body.Close()
+	_, _ = io.Copy(io.Discard, post2.Body)
+	_ = post2.Body.Close()
 
 	f.mu.Lock()
 	if len(f.genReqs) != 2 {
@@ -251,8 +251,8 @@ func TestEndToEnd_SessionAffinity(t *testing.T) {
 	post3 := postMessages(t, proxy, anthropicReq, map[string]string{
 		"x-api-key": "user_test123", "X-Session-Id": "explicit-session-42",
 	})
-	io.Copy(io.Discard, post3.Body)
-	post3.Body.Close()
+	_, _ = io.Copy(io.Discard, post3.Body)
+	_ = post3.Body.Close()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.genReqs) != 3 {
@@ -296,7 +296,7 @@ func TestEndToEnd_NonStreamAggregation(t *testing.T) {
 
 	req := strings.Replace(anthropicReq, `"stream": true`, `"stream": false`, 1)
 	resp := postMessages(t, proxy, req, map[string]string{"x-api-key": "user_test123"})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -338,38 +338,38 @@ func TestEndToEnd_AuthAndValidation(t *testing.T) {
 
 	// 401：缺 key
 	resp := postMessages(t, proxy, anthropicReq, nil)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("no key: status = %d, want 401", resp.StatusCode)
 	}
 	// 401：非 user_ key
 	resp = postMessages(t, proxy, anthropicReq, map[string]string{"x-api-key": "sk-bad"})
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("bad key: status = %d, want 401", resp.StatusCode)
 	}
 	// 400：坏 JSON
 	resp = postMessages(t, proxy, `{not json`, map[string]string{"x-api-key": "user_test123"})
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("bad json: status = %d, want 400", resp.StatusCode)
 	}
 	// 400：空 messages
 	resp = postMessages(t, proxy, `{"model":"m","messages":[]}`, map[string]string{"x-api-key": "user_test123"})
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("empty messages: status = %d, want 400", resp.StatusCode)
 	}
 	// 413：超限（MaxBodyBytes 压到 1KB）
 	small := newProxy(t, f, func(c *config.Config) { c.MaxBodyBytes = 1024 })
 	resp = postMessages(t, small, anthropicReq+strings.Repeat(" ", 4096), map[string]string{"x-api-key": "user_test123"})
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversize: status = %d, want 413", resp.StatusCode)
 	}
 	// 404：未知路径
 	resp2, _ := http.Get(proxy.URL + "/v1/unknown")
-	resp2.Body.Close()
+	_ = resp2.Body.Close()
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Errorf("unknown path: status = %d, want 404", resp2.StatusCode)
 	}
@@ -384,7 +384,7 @@ func TestEndToEnd_UpstreamErrorMapping(t *testing.T) {
 	proxy := newProxy(t, f, nil)
 
 	resp := postMessages(t, proxy, anthropicReq, map[string]string{"x-api-key": "user_test123"})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
@@ -410,7 +410,7 @@ func TestEndToEnd_ZeroOutputReturns429BeforeHeaders(t *testing.T) {
 	proxy := newProxy(t, f, nil)
 
 	resp := postMessages(t, proxy, anthropicReq, map[string]string{"x-api-key": "user_test123"})
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("zero output: status = %d, want 429 (delayed 200)", resp.StatusCode)
 	}
@@ -424,8 +424,8 @@ func TestEndToEnd_LifecyclePreRequests(t *testing.T) {
 	proxy := newProxy(t, f, nil)
 
 	resp := postMessages(t, proxy, anthropicReq, map[string]string{"x-api-key": "user_test456"})
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -445,7 +445,7 @@ func TestEndToEnd_Models(t *testing.T) {
 	}
 	var body map[string]any
 	_ = json.NewDecoder(resp.Body).Decode(&body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	data := body["data"].([]any)
 	first := data[0].(map[string]any)
 	if first["type"] != "model" || first["id"] != "claude-sonnet-4-6" {
@@ -460,7 +460,7 @@ func TestEndToEnd_Health(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK || string(b) != "OK" {
 		t.Errorf("health = %d %q", resp.StatusCode, b)
