@@ -81,7 +81,7 @@ cmdc 的 prompt cache 按会话粒度工作。本代理三层配合：
 
 1. **显式 session 头优先**：入站 `x-session-id` / `x-claude-code-session-id` / `session_id`（≥8 字符）直接作为上游会话 ID；
 2. **前缀派生**（默认）：无显式头时从 `sha256(system + tools + 首条用户消息)` 派生稳定的 UUID 形会话 ID —— 同一对话跨轮次复用同一会话；前缀变化（工具集变更、上下文压缩）时自动换会话；
-3. **part 级缓存标记**：content 块上的 `cache_control` 原位保留（归一为 `{type:"ephemeral"}`）；system / tools 上的标记折算为首个 user 消息末尾 text part 的合成标记。
+3. **part 级缓存标记**：content 块上的 `cache_control` 原位保留（归一为 `{type:"ephemeral"}`）；system / tools 上的标记折算为**最后一条 user 消息**末尾 text part 的合成标记 —— 断点跟随对话增长，缓存覆盖除最近一轮外的全部历史。
 
 ### 客户端伪装
 

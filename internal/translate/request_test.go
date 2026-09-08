@@ -319,6 +319,53 @@ func TestBuildCcRequest_ToolSchemaNormalized(t *testing.T) {
 	}
 }
 
+func TestBuildCcRequest_CacheMarkerFollowsConversationTail(t *testing.T) {
+	req := parseReq(t, `{
+		"max_tokens": 100,
+		"system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "turn1"}]},
+			{"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+			{"role": "user", "content": [{"type": "text", "text": "turn2"}]},
+			{"role": "assistant", "content": [{"type": "text", "text": "ok2"}]},
+			{"role": "user", "content": [{"type": "text", "text": "turn3"}]}
+		]
+	}`)
+	cc, _ := BuildCcRequest(req, testOpts())
+	msgs := cc.Params.Messages
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %d", len(msgs))
+	}
+	if cc.Params.Messages[0].Content[0].CacheControl != nil {
+		t.Error("marker must NOT sit on the first user turn (caps cache at static prefix)")
+	}
+	if m := msgs[4].Content[0]; m.CacheControl == nil || m.CacheControl.Type != "ephemeral" {
+		t.Errorf("marker must sit on the last user turn's text part: %+v", m)
+	}
+}
+
+func TestBuildCcRequest_CacheMarkerFallsBackPastToolResultTail(t *testing.T) {
+	req := parseReq(t, `{
+		"max_tokens": 100,
+		"tools": [{"name": "f", "input_schema": {"type": "object", "properties": {}}, "cache_control": {"type": "ephemeral"}}],
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "go"}]},
+			{"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {}}]},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "res"}]}
+		]
+	}`)
+	cc, _ := BuildCcRequest(req, testOpts())
+	msgs := cc.Params.Messages
+	// 末条消息只有 tool_result（无 text part）→ 标记回退到上一条 user 文本；
+	// 该轮 tool_result 当轮不缓存，下一轮成为前缀后命中
+	if m := msgs[0].Content[0]; m.CacheControl == nil {
+		t.Errorf("marker should fall back to the previous user text part: %+v", msgs[0].Content[0])
+	}
+	if tr := msgs[2].Content[0]; tr.CacheControl != nil {
+		t.Errorf("tool_result part should not carry the marker (unverified shape): %+v", tr)
+	}
+}
+
 func TestPrefixCacheKey_StableWithinConversation(t *testing.T) {
 	turn1 := parseReq(t, `{
 		"system": "You are helpful.",

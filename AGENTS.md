@@ -27,9 +27,19 @@ commit `fcdb56a`）；转换架构手法参考 `reference/sub2api/backend/intern
 ## 待实弹验证（小号低频，不阻塞开发）
 
 1. usage `inputTokens` 是否含 `cachedInputTokens`（当前按原版直接透传）。
+   两读均与实测数据吻合，唯一硬判据是上游计费口径；若确认含缓存桶，
+   需改为 `input_tokens = inputTokens - cachedInputTokens`（钳 ≥0）。
 2. `CC_ASSISTANT_REASONING=1` 时 `{type:reasoning}` assistant 历史块上游是否接受
    （形状是推测的，默认关闭即丢弃）。
-3. cache_control 标记 + 前缀派生会话是否带来 `cache_read_input_tokens > 0`（验收标准 2）。
+
+## 缓存实弹结论（2026-09-08）
+
+- part 级 `cache_control` **确实被上游作为缓存断点**：实测缓存读取恒定封顶在
+  合成标记位置（≈ 静态前缀体量），随对话增长命中率被稀释到 ~50%。
+- 合成标记位置已从「第一条 user 消息」（PR#10 原位）移到「最后一条 user 消息的
+  末尾 text part」—— 断点跟随对话末尾，缓存应覆盖除最近一轮外全部历史。
+- 未验证：tool_result part 上挂标记是否被接受（现只落在 text part 上，
+  纯 tool_result 收尾的轮次回退到上一处文本，当轮尾部不缓存）。
 
 ## 已知陷阱
 

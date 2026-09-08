@@ -493,8 +493,11 @@ func thinkingEffort(raw json.RawMessage) string {
 // ---------- 缓存标记 ----------
 
 // synthesizeCacheMarker 请求携带 cache_control（system/tools 上，无法落在
-// part 上）但没有任何 part 级标记时，在首个 user 消息最后一个 text part 上
-// 补 {type:"ephemeral"} —— PR#10 验证过的上游缓存信号位置。
+// part 上）但没有任何 part 级标记时，在最后一条 user 消息的最后一个 text
+// part 上补 {type:"ephemeral"}。
+// 实弹结论：断点必须跟随对话末尾。初版沿 PR#10 放在第一条 user 消息上，
+// 实测缓存恒定封顶在静态前缀（system+tools+首轮 ≈ 38K），对话增长后命中
+// 率被稀释到 ~50%；移到末尾后缓存覆盖全部历史（除最近一轮）。
 func synthesizeCacheMarker(msgs []types.CcMessage, need bool, warns *[]string) {
 	if !need {
 		return
@@ -506,19 +509,18 @@ func synthesizeCacheMarker(msgs []types.CcMessage, need bool, warns *[]string) {
 			}
 		}
 	}
-	for i := range msgs {
+	// 从后往前找最后一个 user 消息里的最后一个 text part。只落在 text part
+	// 上（PR#10 验证过的形状）；纯 tool_result 的收尾轮退回上一处文本，
+	// 该轮 tool_results 当轮不缓存、下一轮成为前缀后命中。
+	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role != "user" {
 			continue
 		}
-		lastText := -1
-		for j := range msgs[i].Content {
+		for j := len(msgs[i].Content) - 1; j >= 0; j-- {
 			if msgs[i].Content[j].Type == "text" {
-				lastText = j
+				msgs[i].Content[j].CacheControl = &types.CacheControl{Type: "ephemeral"}
+				return
 			}
-		}
-		if lastText >= 0 {
-			msgs[i].Content[lastText].CacheControl = &types.CacheControl{Type: "ephemeral"}
-			return
 		}
 	}
 	*warns = append(*warns, "cache_control present on system/tools but no user text part to carry the marker")

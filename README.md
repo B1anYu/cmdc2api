@@ -98,8 +98,9 @@ mechanisms:
    context compaction) the session rotates automatically;
 3. **Part-level cache markers**: `cache_control` on content blocks is kept in
    place (normalized to `{type:"ephemeral"}`); markers on system / tools are
-   folded into a synthesized marker on the trailing text part of the first user
-   message.
+   folded into a synthesized marker on the trailing text part of the **last
+   user message** — the breakpoint follows the conversation as it grows, so
+   the cache covers the full history except the newest turn.
 
 ### Client masquerade
 
