@@ -56,11 +56,13 @@
 - 相同请求在上游控制台记录的「总输入」正好为 API `inputTokens` 的一半（例如 80K vs 40K）。
 
 ### 2. 模型机理
-- cmdc 内部多步循环按步累加 usage（Step 1 全量处理产生 $P$、Step 2 全量命中缓存产生 $P$ 缓存读取）$\rightarrow$ $I \approx 2P, C \approx P$。
+- cmdc 内部多步循环按步累加 usage（Step 1 全量处理产生 P、Step 2 全量命中缓存产生 P 缓存读取）→ I ≈ 2P, C ≈ P。
 - 上游后台按去重 Prompt 计费。
 
 ### 3. 定案公式
-$$\text{input\_tokens} = \max(0, \text{inputTokens} - \text{cachedInputTokens})$$
+```text
+input_tokens = max(0, inputTokens - cachedInputTokens)
+```
 - 在「多步求和」与「总量含缓存」两种模型下均等于真实消耗，且与上游后台总输入一致。
 - 抽验指标：网关 `input_tokens` 必须与 cmdc 后台总输入统计对齐。
 

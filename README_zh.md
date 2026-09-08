@@ -142,7 +142,11 @@ cmdc 上游的 Prompt Cache 依赖会话（Session）粒度运作。代理结合
 ### 4. 准确的 Token 计费口径
 
 实测发现上游返回的 `inputTokens` 在其内部多步循环中把缓存读取重复累加（数值约为后台控制台统计的两倍）。代理采用换算公式：
-$$\text{input\_tokens} = \max(0, \text{inputTokens} - \text{cachedInputTokens})$$
+
+```text
+input_tokens = max(0, inputTokens - cachedInputTokens)
+```
+
 该口径精准对齐 cmdc 后台控制台的去重实际输入统计。
 
 ---

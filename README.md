@@ -142,7 +142,11 @@ Mirrors the observable characteristics of the official Node CLI:
 ### 4. Accurate Token Accounting
 
 Empirical verification revealed that cmdc upstream's `inputTokens` accumulates cached reads across internal loop steps (approximately 2× console totals). The proxy applies the normalized formula:
-$$\text{input\_tokens} = \max(0, \text{inputTokens} - \text{cachedInputTokens})$$
+
+```text
+input_tokens = max(0, inputTokens - cachedInputTokens)
+```
+
 This aligns with the actual deduplicated prompt counts reported in the cmdc web console.
 
 ---
