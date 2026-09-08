@@ -40,6 +40,10 @@ commit `fcdb56a`）；转换架构手法参考 `reference/sub2api/backend/intern
   末尾 text part」—— 断点跟随对话末尾，缓存应覆盖除最近一轮外全部历史。
 - 未验证：tool_result part 上挂标记是否被接受（现只落在 text part 上，
   纯 tool_result 收尾的轮次回退到上一处文本，当轮尾部不缓存）。
+- 断点控制权归属：客户端消息级断点到达即透传且不合成（hasMarker 优先）；
+  合成仅在入站消息级断点缺失时兜底。实测兜底在唯一生效 → Claude Code 的
+  消息级断点疑似被中间跳（axonhub）剥离；合成发生时会打 WARN，含
+  "no part-level cache_control found on inbound messages"，tail 日志即可定案。
 
 ## 已知陷阱
 

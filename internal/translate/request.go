@@ -519,6 +519,8 @@ func synthesizeCacheMarker(msgs []types.CcMessage, need bool, warns *[]string) {
 		for j := len(msgs[i].Content) - 1; j >= 0; j-- {
 			if msgs[i].Content[j].Type == "text" {
 				msgs[i].Content[j].CacheControl = &types.CacheControl{Type: "ephemeral"}
+				*warns = append(*warns,
+					"no part-level cache_control found on inbound messages; synthesized breakpoint on the last user text part (system/tools markers folded — the cmdc envelope has no fields to carry them). If the client is expected to send message-level markers (e.g. Claude Code), they are being stripped by an intermediate hop")
 				return
 			}
 		}
