@@ -108,7 +108,8 @@ func TestStream_FullLifecycleBlockInvariants(t *testing.T) {
 	if md.Delta.StopReason != "tool_use" {
 		t.Errorf("stop_reason = %s, want tool_use", md.Delta.StopReason)
 	}
-	if md.Usage.OutputTokens != 42 || md.Usage.InputTokens != 100 ||
+	// input_tokens 需扣除缓存桶（cmdc 的 inputTokens 重复计入缓存读取）
+	if md.Usage.OutputTokens != 42 || md.Usage.InputTokens != 90 ||
 		md.Usage.CacheReadInputTokens != 10 || md.Usage.CacheCreationInputTokens == nil || *md.Usage.CacheCreationInputTokens != 5 {
 		t.Errorf("message_delta usage wrong: %+v", md.Usage)
 	}

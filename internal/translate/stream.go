@@ -191,7 +191,15 @@ func (t *StreamTranslator) DeltaUsage() types.DeltaUsage {
 	if cacheWrite > 0 {
 		ccPtr = &cacheWrite
 	}
-	input, cached := u.InputTokens, u.CachedInputTokens
+	// 实弹定案（2026-09-09，cmdc 后台对照）：cmdc 的 inputTokens 把缓存
+	// 读取重复计入——后台「总输入（缓存+未缓存）」≈ inputTokens −
+	// cachedInputTokens（实测 80K vs 40K）。按 Anthropic 语义换算：
+	// input_tokens 只报扣除缓存桶后的部分，钳 ≥0。
+	input := u.InputTokens - u.CachedInputTokens
+	if input < 0 {
+		input = 0
+	}
+	cached := u.CachedInputTokens
 	if !t.hasUsage {
 		input, cached = 0, 0
 	}
