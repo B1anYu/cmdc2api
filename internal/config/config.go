@@ -34,7 +34,7 @@ type Config struct {
 
 func Load() Config {
 	c := Config{
-		Port:              3050,
+		Port:              8050,
 		Host:              "127.0.0.1",
 		APIBase:           "https://api.commandcode.ai",
 		StateFile:         "data/state.json",

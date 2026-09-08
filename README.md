@@ -1,136 +1,169 @@
 # cmdc2api
 
-Anthropic Messages API → cmdc（Command Code）直转代理。
+[English](README.md) | 简体中文
 
-Go 实现，零第三方依赖，静态二进制部署。命令行编程助手类客户端以 Anthropic 协议接入，
-本代理将请求单跳转换为 cmdc 信封格式转发上游，完整保留图片、思考链与缓存标记，
-并在请求层还原官方 CLI 的客户端指纹。
+A direct-mapping proxy from the Anthropic Messages API to cmdc (Command Code).
 
-## 特性
+Written in Go with zero third-party dependencies, shipped as a static binary.
+Clients that speak the Anthropic protocol (CLI coding assistants and similar
+tools) connect to this proxy, which converts each request in a single hop to
+the cmdc envelope format and forwards it upstream — preserving images, thinking
+blocks, and cache markers — while reproducing the official CLI's client
+fingerprint at the request layer.
 
-- **单跳直转** —— Anthropic → cmdc 一步到位，不经 OpenAI chat 中间层
-- **完整图片支持** —— 用户消息图片（base64 / URL）透传；tool_result 内嵌图片自动搬迁
-- **缓存亲和** —— `cache_control` 标记保留与合成，配合稳定会话派生，最大化 prompt cache 命中
-- **客户端伪装** —— 设备指纹、lifecycle 预请求、实时 CLI 版本号、OTel traceparent、传输层指纹对齐
-- **流式 / 非流式** —— 上游恒流式，代理按入站需求输出 Anthropic SSE 或聚合 JSON，两种形态语义一致
-- **准确计费语义** —— usage 直读上游终值；零输出响应按 429 处理并带 Retry-After，防止下游误计费
+## Features
 
-## 快速开始
+- **Single-hop conversion** — Anthropic → cmdc in one step, no OpenAI chat intermediary
+- **Full image support** — user-message images (base64 / URL) pass through; images embedded in `tool_result` are automatically relocated
+- **Cache affinity** — `cache_control` markers preserved and synthesized, combined with stable session derivation for maximum prompt-cache hits
+- **Client masquerade** — device fingerprint, lifecycle pre-requests, live CLI version, OTel traceparent, transport-layer fingerprint alignment
+- **Streaming & non-streaming** — the upstream is always streamed; the proxy emits Anthropic SSE or aggregated JSON on demand, with identical semantics in both forms
+- **Accurate billing semantics** — usage read from the upstream's final totals; zero-output responses surface as 429 with `Retry-After` to prevent downstream mis-billing
 
-Docker（推荐，双架构 linux/amd64 + arm64）：
+## Quick Start
+
+Docker (recommended; linux/amd64 + arm64):
 
 ```bash
 docker compose up -d   # ghcr.io/b1anyu/cmdc2api:latest
 ```
 
-本地裸跑：
+Run from source:
 
 ```bash
 go build -o cmdc2api . && ./cmdc2api
 ```
 
-服务默认监听 `127.0.0.1:3050`。鉴权使用 cmdc 账号 key，原样透传上游：
+The server listens on `127.0.0.1:8050` by default. Authenticate with your cmdc
+account key, which is forwarded to the upstream unchanged:
 
 ```bash
-curl http://127.0.0.1:3050/v1/messages \
+curl http://127.0.0.1:8050/v1/messages \
   -H "x-api-key: user_xxx" \
   -H "content-type: application/json" \
   -d '{
     "model": "deepseek/deepseek-v4-flash",
     "max_tokens": 1024,
     "stream": true,
-    "messages": [{"role": "user", "content": "你好"}]
+    "messages": [{"role": "user", "content": "Hello"}]
   }'
 ```
 
-## 端点
+## Endpoints
 
-| 路径 | 说明 |
+| Path | Description |
 |---|---|
-| `POST /v1/messages` | Anthropic Messages（流式 SSE + 非流式 JSON） |
-| `GET /v1/models` | 模型列表（带 key 透传上游，否则回退内置列表） |
-| `GET /health` | 健康检查 |
+| `POST /v1/messages` | Anthropic Messages (streaming SSE + non-streaming JSON) |
+| `GET /v1/models` | Model list (forwarded upstream with a key; built-in fallback otherwise) |
+| `GET /health` | Health check |
 
-鉴权头：`Authorization: Bearer user_xxx` 或 `x-api-key: user_xxx`。
+Auth headers: `Authorization: Bearer user_xxx` or `x-api-key: user_xxx`.
 
-## 配置（环境变量）
+## Configuration (environment variables)
 
-| 变量 | 默认 | 说明 |
+| Variable | Default | Description |
 |---|---|---|
-| `PORT` / `HOST` | `3050` / `127.0.0.1` | 监听地址（容器内需 `HOST=0.0.0.0`） |
-| `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 |
-| `CC_STATE_FILE` | `data/state.json` | 设备指纹与生命周期节流状态的持久化路径 |
-| `CC_MAX_BODY_MB` | `100` | 入站请求体上限 |
-| `CC_SESSION_STRATEGY` | `prefix` | 会话策略：`prefix`（按对话稳定）/ `key`（按 key 12h+1h 轮换） |
-| `CC_ASSISTANT_REASONING` | `0` | 实验功能：将历史 thinking 块以 `{type:reasoning}` 回传上游 |
-| `CC_FAKE_NODE_VERSION` | `v22.21.0` | 信封 environment 字段中的 Node 版本 |
-| `CMD_ZDR` | `0` | 附加 `x-cmd-zdr: 1` 仅走 ZDR 路由（也可逐请求头指定） |
-| `CC_MODEL_REFRESH` | `5m` | 模型列表缓存时长 |
+| `PORT` / `HOST` | `8050` / `127.0.0.1` | Listen address (containers need `HOST=0.0.0.0`) |
+| `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL |
+| `CC_STATE_FILE` | `data/state.json` | Persistence path for the device fingerprint and lifecycle throttle state |
+| `CC_MAX_BODY_MB` | `100` | Inbound request body limit |
+| `CC_SESSION_STRATEGY` | `prefix` | Session strategy: `prefix` (stable per conversation) / `key` (per-key, 12h+1h rotation) |
+| `CC_ASSISTANT_REASONING` | `0` | Experimental: replay historical thinking blocks upstream as `{type:reasoning}` |
+| `CC_FAKE_NODE_VERSION` | `v22.21.0` | Node version reported in the envelope's `environment` field |
+| `CMD_ZDR` | `0` | Attach `x-cmd-zdr: 1` to route via ZDR only (also settable per request) |
+| `CC_MODEL_REFRESH` | `5m` | Model list cache duration |
 
-## 设计说明
+## Design Notes
 
-### 转换路径
+### Conversion path
 
-cmdc 信封本身就是 messages 风味（content 为块数组、tools 用 `input_schema`、tool_choice
-为 Anthropic 风格），与 Anthropic 协议天然最近。本代理因此不做 Anthropic → OpenAI chat
-的中间转换，请求侧字段一步映射，规避两阶段转换固有的字段丢失。
+The cmdc envelope is already messages-flavored (block-array `content`, tools
+with `input_schema`, Anthropic-style `tool_choice`) — closest to the Anthropic
+protocol itself. This proxy therefore skips the Anthropic → OpenAI chat
+intermediate step entirely and maps request fields in one pass, avoiding the
+field loss inherent in a two-stage conversion.
 
-### 缓存亲和
+### Cache affinity
 
-cmdc 的 prompt cache 按会话粒度工作。本代理三层配合：
+cmdc's prompt cache works at session granularity. The proxy combines three
+mechanisms:
 
-1. **显式 session 头优先**：入站 `x-session-id` / `x-claude-code-session-id` / `session_id`（≥8 字符）直接作为上游会话 ID；
-2. **前缀派生**（默认）：无显式头时从 `sha256(system + tools + 首条用户消息)` 派生稳定的 UUID 形会话 ID —— 同一对话跨轮次复用同一会话；前缀变化（工具集变更、上下文压缩）时自动换会话；
-3. **part 级缓存标记**：content 块上的 `cache_control` 原位保留（归一为 `{type:"ephemeral"}`）；system / tools 上的标记折算为首个 user 消息末尾 text part 的合成标记。
+1. **Explicit session headers win**: inbound `x-session-id` /
+   `x-claude-code-session-id` / `session_id` (≥ 8 chars) are used as the
+   upstream session ID directly;
+2. **Prefix derivation** (default): with no explicit header, a stable
+   UUID-shaped session ID is derived from
+   `sha256(system + tools + first user message)` — the same conversation keeps
+   the same session across turns; when the prefix changes (tool set changes,
+   context compaction) the session rotates automatically;
+3. **Part-level cache markers**: `cache_control` on content blocks is kept in
+   place (normalized to `{type:"ephemeral"}`); markers on system / tools are
+   folded into a synthesized marker on the trailing text part of the first user
+   message.
 
-### 客户端伪装
+### Client masquerade
 
-对齐官方 CLI 的可观察行为：Windows x64 设备指纹（持久化，重启不变）、
-`/alpha/fingerprint/record` 与 `/alpha/lifecycle-events` 预请求（8h + 2h 抖动节流）、
-npm 实时拉取 CLI 版本号写入 `x-command-code-version`、按会话派生的 project-slug、
-W3C traceparent。传输层强制 HTTP/1.1 并不发送 User-Agent，与 Node CLI 的出站特征一致。
+Mirrors the observable behavior of the official CLI: a Windows x64 device
+fingerprint (persisted, stable across restarts), pre-requests to
+`/alpha/fingerprint/record` and `/alpha/lifecycle-events` (throttled on an
+8h + 2h jittered schedule), the CLI version pulled live from npm into
+`x-command-code-version`, a per-session derived project slug, and a W3C
+traceparent. At the transport layer the proxy forces HTTP/1.1 and sends no
+User-Agent, matching the Node CLI's outbound characteristics.
 
-### 已知限制
+### Known limitations
 
-- cmdc 强制 `params.system` 为字符串（数组直接 400），system 的块结构与缓存断点走上述折算路径；
-- thinking 签名为确定性伪造（sha256 + 0x12 前缀）：第三方代理无法铸造真实签名，该方案满足客户端浅校验且同一文本签名稳定；
-- 上游无对应能力的字段被丢弃：`stop_sequences`、`top_k`、`metadata.user_id`、tool_result 的 `is_error`；
-- 上游 usage 语义（`inputTokens` 是否含缓存桶）按上游参考实现的口径直接透传。
+- cmdc requires `params.system` to be a string (arrays are rejected with 400);
+  block structure and cache breakpoints on system / tools go through the
+  folding path described above;
+- thinking signatures are deterministic forgeries (sha256 + 0x12 prefix): a
+  third-party proxy cannot mint real signatures, and this scheme satisfies
+  clients' shallow validation with a stable signature per text;
+- fields with no upstream equivalent are dropped: `stop_sequences`, `top_k`,
+  `metadata.user_id`, and `is_error` on tool results;
+- upstream usage semantics (whether `inputTokens` includes the cached bucket)
+  are passed through as reported by the upstream reference implementation.
 
-## 与 commandcode-proxy 的对比
+## Comparison with commandcode-proxy
 
-协议知识来自 [commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)（MIT），
-转换架构手法参考 [sub2api](https://github.com/Wei-Shaw/sub2api) 的 `apicompat` 包。
+Protocol knowledge comes from
+[commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) (MIT);
+conversion techniques draw on the `apicompat` package of
+[sub2api](https://github.com/Wei-Shaw/sub2api).
 
-| 方面 | commandcode-proxy（Node） | cmdc2api |
+| Aspect | commandcode-proxy (Node) | cmdc2api |
 |---|---|---|
-| 转换路径 | Anthropic → OpenAI chat → cmdc（两阶段） | Anthropic → cmdc 直转 |
-| 用户消息图片 | 静默丢弃 | base64 转 data URI 透传，URL 原样 |
-| tool_result 内图片 | 只拼接文本 | 搬迁到后续 user 消息 |
-| cache_control | Anthropic 路径全丢 | part 级保留/合成 + 会话亲和 |
-| 前轮 thinking 块 | 丢弃 | 默认丢弃，`CC_ASSISTANT_REASONING=1` 回传 |
-| usage 记账 | tool 调用按 +20 估算 | 直读上游 totalUsage |
-| 设备指纹 | 内存态，重启即换 | 落盘持久化，重启不变 |
-| 环境自洽 | win32 指纹 + Linux workingDir | 全套 win32 自洽 |
-| 部署形态 | node:22-alpine 容器 | Go 静态二进制 / 最小镜像 |
+| Conversion path | Anthropic → OpenAI chat → cmdc (two stages) | Anthropic → cmdc direct |
+| User-message images | Silently dropped | base64 → data URI passthrough, URLs kept |
+| Images in tool_result | Text concatenated only | Relocated into a following user message |
+| cache_control | Lost on the Anthropic path | Part-level preserved/synthesized + session affinity |
+| Historical thinking blocks | Dropped | Dropped by default; `CC_ASSISTANT_REASONING=1` replays them |
+| Usage accounting | Estimated at +20 per tool call | Read from the upstream's totalUsage |
+| Device fingerprint | In-memory, lost on restart | Persisted to disk, stable |
+| Environment consistency | win32 fingerprint + Linux workingDir | Fully self-consistent win32 |
+| Deployment artifact | node:22-alpine container | Go static binary / minimal image |
 
-## 开发
+## Development
 
 ```bash
-go test -race ./...   # 单测 + 端到端（内置假上游）
+go test -race ./...   # unit + end-to-end tests (built-in fake upstream)
 go vet ./...
 ```
 
 ```
-internal/config     配置加载（纯环境变量）
-internal/masq       客户端伪装层：指纹/会话/版本号/lifecycle/上游客户端
-internal/types      线上协议类型（Anthropic 入站、cmdc 信封与事件、SSE 事件）
-internal/translate  协议转换：请求直转、流式状态机、非流式聚合
-internal/server     HTTP 入口：路由/中间件/错误映射
+internal/config     Configuration loading (environment variables only)
+internal/masq       Client masquerade: fingerprint/sessions/version/lifecycle/upstream client
+internal/types      Wire protocol types (Anthropic inbound, cmdc envelope & events, SSE events)
+internal/translate  Protocol conversion: request mapping, streaming state machine, aggregation
+internal/server     HTTP entrypoint: routing/middleware/error mapping
 ```
 
-## 免责声明
+## Disclaimer
 
-本项目仅供学习与技术研究使用。使用者应自行确保其使用行为符合所在地法律法规以及
-相关服务的条款；因使用本项目所产生的一切后果由使用者自行承担，项目作者不承担任何
-责任。本项目为独立的开源实现，与文中提及的其他项目及任何上游服务方均无隶属或合作关系。
+This project is provided for learning and technical research purposes only.
+Users are responsible for ensuring that their use complies with applicable
+laws and regulations in their jurisdiction as well as the terms of any services
+involved. All consequences arising from the use of this project are borne by
+the user; the authors accept no liability. This project is an independent
+open-source implementation and is not affiliated with, or endorsed by, any of
+the projects or upstream services mentioned above.
