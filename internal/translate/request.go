@@ -125,9 +125,9 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 func PrefixCacheKey(req *types.Request) string {
 	h := sha256.New()
 	sys, _ := parseSystem(req.System)
-	fmt.Fprintf(h, "system:%s\n", sys)
+	_, _ = fmt.Fprintf(h, "system:%s\n", sys)
 	for _, t := range req.Tools {
-		fmt.Fprintf(h, "tool:%s:%s\n", t.Name, t.InputSchema)
+		_, _ = fmt.Fprintf(h, "tool:%s:%s\n", t.Name, t.InputSchema)
 	}
 	first := ""
 	for i := range req.Messages {
@@ -146,7 +146,7 @@ func PrefixCacheKey(req *types.Request) string {
 	if len(first) > 4096 {
 		first = first[:4096]
 	}
-	fmt.Fprintf(h, "first:%s", first)
+	_, _ = fmt.Fprintf(h, "first:%s", first)
 	sum := hex.EncodeToString(h.Sum(nil))
 	// UUID 形状（8-4-4-4-12），与真实 CLI 会话 ID 一致
 	return sum[0:8] + "-" + sum[8:12] + "-" + sum[12:16] + "-" + sum[16:20] + "-" + sum[20:32]
