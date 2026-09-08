@@ -67,6 +67,24 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		warns = append(warns, "request produced no convertible messages")
 	}
 
+	// 断点可观测（info 级）：记录入站消息级 cache_control 的透传落点，
+	// 与 synthesizeCacheMarker 的告警互斥互补——两条日志二选一出现，
+	// 即可判定客户端断点是在透传还是中途丢失
+	var markerIdx []int
+	for i := range parsed {
+		for _, b := range parsed[i].blocks {
+			if b.CacheControl != nil {
+				markerIdx = append(markerIdx, i)
+				break
+			}
+		}
+	}
+	if len(markerIdx) > 0 {
+		warns = append(warns, fmt.Sprintf(
+			"info: %d inbound part-level cache_control marker(s) passed through at inbound message indexes %v",
+			len(markerIdx), markerIdx))
+	}
+
 	synthesizeCacheMarker(ccMsgs, sysCC || toolsCC, &warns)
 
 	model := req.Model

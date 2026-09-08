@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/B1anYu/cmdc2api/internal/masq"
@@ -51,6 +52,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		AssistantReasoning: s.cfg.AssistantReasoning,
 	})
 	for _, wn := range warns {
+		// "info: " 前缀的是观测性信息（如断点透传落点），不算异常
+		if strings.HasPrefix(wn, "info: ") {
+			slog.Info("convert", "detail", wn, "model", areq.Model)
+			continue
+		}
 		slog.Warn("convert", "detail", wn, "model", areq.Model)
 	}
 
