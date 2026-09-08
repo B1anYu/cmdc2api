@@ -126,10 +126,10 @@ User-Agent, matching the Node CLI's outbound characteristics.
   clients' shallow validation with a stable signature per text;
 - fields with no upstream equivalent are dropped: `stop_sequences`, `top_k`,
   `metadata.user_id`, and `is_error` on tool results;
-- the upstream's `inputTokens` double-counts cache reads (confirmed against
-  the upstream console and a healthy Anthropic channel side-by-side); the
-  proxy converts to Anthropic semantics — `input_tokens` reports only the
-  uncached portion.
+- the upstream's `inputTokens` double-counts cached tokens across its
+  internal steps (confirmed against the upstream console: the console total
+  is exactly half of the API figure); the proxy reports
+  `input_tokens = inputTokens − cachedInputTokens` to match the console.
 
 ## References
 

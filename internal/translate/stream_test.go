@@ -108,9 +108,9 @@ func TestStream_FullLifecycleBlockInvariants(t *testing.T) {
 	if md.Delta.StopReason != "tool_use" {
 		t.Errorf("stop_reason = %s, want tool_use", md.Delta.StopReason)
 	}
-	// input_tokens = 未缓存量（inputTokens − 2×cached = 100 − 20 = 80），
-	// 与正常 Anthropic 渠道同形状
-	if md.Usage.OutputTokens != 42 || md.Usage.InputTokens != 80 ||
+	// input_tokens = inputTokens − cached = 100 − 10 = 90（上游重复计入的
+	// 缓存读取已扣除）
+	if md.Usage.OutputTokens != 42 || md.Usage.InputTokens != 90 ||
 		md.Usage.CacheReadInputTokens != 10 || md.Usage.CacheCreationInputTokens == nil || *md.Usage.CacheCreationInputTokens != 5 {
 		t.Errorf("message_delta usage wrong: %+v", md.Usage)
 	}

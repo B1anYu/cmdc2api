@@ -191,13 +191,15 @@ func (t *StreamTranslator) DeltaUsage() types.DeltaUsage {
 	if cacheWrite > 0 {
 		ccPtr = &cacheWrite
 	}
-	// 实弹定案（2026-09-09）：cmdc 的 inputTokens 把缓存读取重复计入
-	// （同请求后台总输入 ≈ inputTokens − cachedInputTokens，80K vs 40K；
-	// 与正常 Anthropic 渠道逐字段对照确认 input_tokens 应为未缓存量）。
-	// 换算：input_tokens = inputTokens − 2×cachedInputTokens（钳 ≥0），
-	// 形状与正常渠道一致（未缓存很小 + cache_read 巨大）；cached=0 时
-	// 退化为原值（全未缓存）。
-	input := u.InputTokens - 2*u.CachedInputTokens
+	// 实弹定案（2026-09-09，两轮实测迭代后的最终口径）：cmdc 的 inputTokens
+	// 疑似按内部多步循环求和（tool 回合的 step1 全量处理、step2 全量命中
+	// 缓存），导致 inputTokens ≈ 2×真实prompt、cachedInputTokens ≈ 真实
+	// prompt——C/I 恒定 ~50% 与后台总输入恰为 API 一半均由此而来。
+	// 换算 input_tokens = inputTokens − cachedInputTokens（钳 ≥0）：
+	// 在「多步求和」与「总量含缓存」两种模型下都等于真实口径，且与
+	// 上游后台的总输入对齐。曾试过 −2×cached（报未缓存量），实测把
+	// input_tokens 钳成 0、命中率显示 100%，已证伪废弃。
+	input := u.InputTokens - u.CachedInputTokens
 	if input < 0 {
 		input = 0
 	}

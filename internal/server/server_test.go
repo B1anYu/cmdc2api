@@ -326,8 +326,8 @@ func TestEndToEnd_NonStreamAggregation(t *testing.T) {
 		t.Errorf("stop_reason = %v", msg["stop_reason"])
 	}
 	usage := msg["usage"].(map[string]any)
-	// input_tokens = 未缓存量：100 − 2×10 = 80（与正常 Anthropic 渠道同形状）
-	if usage["input_tokens"] != float64(80) || usage["output_tokens"] != float64(42) ||
+	// input_tokens = inputTokens − cached = 100 − 10 = 90
+	if usage["input_tokens"] != float64(90) || usage["output_tokens"] != float64(42) ||
 		usage["cache_read_input_tokens"] != float64(10) {
 		t.Errorf("usage wrong: %v", usage)
 	}

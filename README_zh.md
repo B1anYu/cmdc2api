@@ -93,7 +93,7 @@ cmdc 的 prompt cache 按会话粒度工作。本代理三层配合：
 - cmdc 强制 `params.system` 为字符串（数组直接 400），system 的块结构与缓存断点走上述折算路径；
 - thinking 签名为确定性伪造（sha256 + 0x12 前缀）：第三方代理无法铸造真实签名，该方案满足客户端浅校验且同一文本签名稳定；
 - 上游无对应能力的字段被丢弃：`stop_sequences`、`top_k`、`metadata.user_id`、tool_result 的 `is_error`；
-- 上游 `inputTokens` 实测把缓存读取重复计入（与上游后台及正常渠道逐字段对照确认），代理已换算为 Anthropic 口径：`input_tokens` 只报未缓存量。
+- 上游 `inputTokens` 实测把缓存读取重复计入（与上游后台对照确认，总量恰为一半），代理已换算：`input_tokens = inputTokens − cachedInputTokens`，与上游后台总输入对齐。
 
 ## References
 
