@@ -127,8 +127,9 @@ User-Agent, matching the Node CLI's outbound characteristics.
 - fields with no upstream equivalent are dropped: `stop_sequences`, `top_k`,
   `metadata.user_id`, and `is_error` on tool results;
 - the upstream's `inputTokens` double-counts cache reads (confirmed against
-  the upstream console); the proxy converts to Anthropic semantics —
-  `input_tokens` excludes the cached bucket.
+  the upstream console and a healthy Anthropic channel side-by-side); the
+  proxy converts to Anthropic semantics — `input_tokens` reports only the
+  uncached portion.
 
 ## References
 

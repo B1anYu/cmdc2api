@@ -48,19 +48,17 @@ printf 'module github.com/Wei-Shaw/sub2api\n\ngo 1.24\n' > reference/sub2api/go.
 
 1. `CC_ASSISTANT_REASONING=1` 时 `{type:reasoning}` assistant 历史块上游是否接受
    （形状是推测的，默认关闭即丢弃）。
-2. cmdc 后台若能读出单请求的「未缓存」明细：实测未缓存 ≈ inputTokens −
-   2×cachedInputTokens（≈1-2K）的话，可把 input_tokens 改报真实未缓存量
-   （当前报 `inputTokens − cachedInputTokens`，与后台总输入一致，但网关侧
-   成本核算仍把缓存 token 按全价计了一次）。
 
-## usage 语义定案（2026-09-09，cmdc 后台对照）
+## usage 语义定案（2026-09-09，后台对照 + 正常渠道逐字段对照）
 
 - **cmdc 的 `inputTokens` 把缓存读取重复计入**：同一请求后台「总输入（缓存+
   未缓存）」≈ 40K，API `inputTokens` ≈ 80K ≈ 40K + 38.5K(cached)。
-- 已修：出站 `input_tokens = inputTokens − cachedInputTokens`（钳 ≥0），
-  与后台总输入对齐；`cache_read` = cachedInputTokens 不变。
+- **最终口径**（与正常 Anthropic 渠道同形状，其 input_tokens=672 未缓存 +
+  cache_read=49152）：出站 `input_tokens = inputTokens − 2×cachedInputTokens`
+  （= 真实未缓存量，实测一条请求仅 65；钳 ≥0；cached=0 时退化为原值）。
+  中间版本「−1×cached」报的是总输入，形状与正常渠道不符，已废弃。
 - **重要修正**：按真实口径反算，历史实测的缓存命中率高达 96~99.9%
-  （真实 prompt 38.5~41.5K，缓存读取紧贴其後）——「命中率 ~50%、缓存封顶
+  （真实 prompt 38.5~41.5K，缓存读取紧贴其后）——「命中率 ~50%、缓存封顶
   38.5K」是网关用灌水 input 当分母造成的假象。缓存本身一直工作正常；
   此前的断点落点修复保留（属于无害加固），但不是问题根因。
 
