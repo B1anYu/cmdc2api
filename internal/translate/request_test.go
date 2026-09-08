@@ -337,7 +337,7 @@ func TestBuildCcRequest_CacheMarkerFollowsConversationTail(t *testing.T) {
 		t.Fatalf("messages = %d", len(msgs))
 	}
 	if cc.Params.Messages[0].Content[0].CacheControl != nil {
-		t.Error("marker must NOT sit on the first user turn (caps cache at static prefix)")
+		t.Error("marker must NOT sit on the first user turn (breakpoint would never advance past it)")
 	}
 	if m := msgs[4].Content[0]; m.CacheControl == nil || m.CacheControl.Type != "ephemeral" {
 		t.Errorf("marker must sit on the last user turn's text part: %+v", m)
@@ -366,10 +366,9 @@ func TestBuildCcRequest_CacheMarkerFallsBackPastToolResultTail(t *testing.T) {
 	}
 }
 
-// 静态分析定案的回归测试（2026-09-09）：agent 式会话的信封尾部是 role:"tool"
-// 消息，合成断点必须从信封整体末尾回扫（允许落在 assistant 的 text part 上），
-// 而不是只扫 user 消息 —— 否则断点钉在第一条人类消息 ≈ 静态前缀，
-// 实测缓存封顶 ~38.5K、命中率被稀释到 ~50%。
+// 回归测试：agent 式会话的信封尾部是 role:"tool" 消息，合成断点必须从信封
+// 整体末尾回扫（允许落在 assistant 的 text part 上），而不是只扫 user 消息
+// —— 只扫 user 时断点钉在第一条人类消息，位置随工具回合永不前进。
 func TestBuildCcRequest_CacheMarkerAdvancesThroughToolRounds(t *testing.T) {
 	req := parseReq(t, `{
 		"max_tokens": 100,
@@ -394,7 +393,7 @@ func TestBuildCcRequest_CacheMarkerAdvancesThroughToolRounds(t *testing.T) {
 		t.Fatalf("messages = %d", len(msgs))
 	}
 	if m := msgs[0].Content[0]; m.CacheControl != nil {
-		t.Error("marker must NOT sit on the first human message (caps cache at static prefix)")
+		t.Error("marker must NOT sit on the first human message (breakpoint would never advance past it)")
 	}
 	// 信封尾部是 tool 消息（无 text part）→ 断点落在全文最后的 text part，
 	// 即倒数第二条 assistant 消息的 "found it" —— 位置随工具回合前进

@@ -99,7 +99,8 @@ type CcEventError struct {
 }
 
 // CcUsage 上游 usage 形状（proxy.mjs normalizeUsage 观察）。
-// 语义待实弹验证：inputTokens 是否含 cachedInputTokens（当前按原版直接透传）。
+// 实弹定案：inputTokens 把缓存读取重复计入（真实总输入 = inputTokens −
+// cachedInputTokens），出站前由 translate 换算为 Anthropic 口径。
 type CcUsage struct {
 	InputTokens       int `json:"inputTokens"`
 	OutputTokens      int `json:"outputTokens"`

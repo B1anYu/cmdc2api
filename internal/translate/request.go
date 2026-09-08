@@ -534,12 +534,10 @@ func thinkingEffort(raw json.RawMessage) string {
 // synthesizeCacheMarker 在需要时把缓存断点合成到信封尾部：从最后一条消息
 // 的最后一个 part 往前找第一个 text part（PR#10 验证过的落点形状），把
 // {type:"ephemeral"} 打在那里。
-// 实弹教训（2026-09-09 静态分析定案）：初版只扫 role=="user" 的消息，而
-// agent 式会话（一条人类消息 + 连续工具回合）的信封尾部全是 role:"tool"
-// 消息，断点永远钉在第一条人类消息 ≈ 静态前缀 —— 实测缓存封顶 ~38.5K、
-// 命中率随对话增长被稀释到 ~50%。必须从信封整体末尾回扫，位置才随对话
-// 前进；text-less 的纯工具轮有一轮迟滞，属可接受代价（cmdc 对非 text
-// part 上标记的接受度未实弹验证，不放上去赌）。
+// 注意从信封整体末尾回扫而非只扫 user 消息：agent 式会话（一条人类消息 +
+// 连续工具回合）的信封尾部全是 role:"tool" 消息，只扫 user 会把断点钉在
+// 第一条人类消息上、位置永不前进。text-less 的纯工具轮有一轮迟滞，属可
+// 接受代价（cmdc 对非 text part 上标记的接受度未实弹验证，不放上去赌）。
 func synthesizeCacheMarker(msgs []types.CcMessage, need, force bool, warns *[]string) {
 	if !need {
 		return
@@ -557,7 +555,7 @@ func synthesizeCacheMarker(msgs []types.CcMessage, need, force bool, warns *[]st
 				msgs[i].Content[j].CacheControl = &types.CacheControl{Type: "ephemeral"}
 				if !force {
 					*warns = append(*warns,
-						"no part-level cache_control found on inbound messages; synthesized breakpoint on the envelope tail's last text part (system/tools markers folded — the cmdc envelope has no fields to carry them). If the client is expected to send message-level markers (e.g. Claude Code), they are being stripped by an intermediate hop")
+						"no part-level cache_control found on inbound messages; synthesized breakpoint on the envelope tail's last text part (system/tools markers folded — the cmdc envelope has no fields to carry them)")
 				}
 				return
 			}
