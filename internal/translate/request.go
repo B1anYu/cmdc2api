@@ -23,6 +23,10 @@ type BuildOpts struct {
 	NodeVersion        string // 例 "v22.21.0"
 	WorkingDir         string // win32 风格伪装路径，由会话派生
 	AssistantReasoning bool   // 实验开关：assistant thinking 块回传上游
+	// CacheMarkers 断点策略："" / "respect"（默认，客户端 part 级标记
+	// 透传，缺失才末尾合成）；"replace"（剥掉客户端标记，强制末尾合成，
+	// 用于 A/B 验证 cmdc 对客户端标记的消费语义）
+	CacheMarkers string
 }
 
 // BuildCcRequest 把 Anthropic 请求直转为 cmdc 信封。
@@ -53,6 +57,23 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		}
 	}
 
+	// CC_CACHE_MARKERS=replace（A/B 用）：剥掉全部入站 part 级标记，
+	// 断点一律由末尾合成 —— 用于验证 cmdc 对客户端原生标记的消费语义
+	replaceMarkers := opts.CacheMarkers == "replace"
+	if replaceMarkers {
+		stripped := 0
+		for i := range parsed {
+			for j := range parsed[i].blocks {
+				if parsed[i].blocks[j].CacheControl != nil {
+					parsed[i].blocks[j].CacheControl = nil
+					stripped++
+				}
+			}
+		}
+		warns = append(warns, fmt.Sprintf(
+			"info: CC_CACHE_MARKERS=replace stripped %d inbound part-level marker(s); breakpoint will be synthesized at the envelope tail", stripped))
+	}
+
 	var ccMsgs []types.CcMessage
 	for i := range parsed {
 		pm := &parsed[i]
@@ -67,13 +88,13 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		warns = append(warns, "request produced no convertible messages")
 	}
 
-	// 断点可观测（info 级）：记录入站消息级 cache_control 的透传落点，
+	// 断点可观测（info 级）：记录信封里实际存在的 part 级标记落点，
 	// 与 synthesizeCacheMarker 的告警互斥互补——两条日志二选一出现，
 	// 即可判定客户端断点是在透传还是中途丢失
 	var markerIdx []int
-	for i := range parsed {
-		for _, b := range parsed[i].blocks {
-			if b.CacheControl != nil {
+	for i := range ccMsgs {
+		for _, p := range ccMsgs[i].Content {
+			if p.CacheControl != nil {
 				markerIdx = append(markerIdx, i)
 				break
 			}
@@ -81,11 +102,11 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 	}
 	if len(markerIdx) > 0 {
 		warns = append(warns, fmt.Sprintf(
-			"info: %d inbound part-level cache_control marker(s) passed through at inbound message indexes %v",
+			"info: %d part-level cache_control marker(s) present in envelope at message indexes %v",
 			len(markerIdx), markerIdx))
 	}
 
-	synthesizeCacheMarker(ccMsgs, sysCC || toolsCC, &warns)
+	synthesizeCacheMarker(ccMsgs, sysCC || toolsCC || replaceMarkers, replaceMarkers, &warns)
 
 	model := req.Model
 	if model == "" {
@@ -510,13 +531,16 @@ func thinkingEffort(raw json.RawMessage) string {
 
 // ---------- 缓存标记 ----------
 
-// synthesizeCacheMarker 请求携带 cache_control（system/tools 上，无法落在
-// part 上）但没有任何 part 级标记时，在最后一条 user 消息的最后一个 text
-// part 上补 {type:"ephemeral"}。
-// 实弹结论：断点必须跟随对话末尾。初版沿 PR#10 放在第一条 user 消息上，
-// 实测缓存恒定封顶在静态前缀（system+tools+首轮 ≈ 38K），对话增长后命中
-// 率被稀释到 ~50%；移到末尾后缓存覆盖全部历史（除最近一轮）。
-func synthesizeCacheMarker(msgs []types.CcMessage, need bool, warns *[]string) {
+// synthesizeCacheMarker 在需要时把缓存断点合成到信封尾部：从最后一条消息
+// 的最后一个 part 往前找第一个 text part（PR#10 验证过的落点形状），把
+// {type:"ephemeral"} 打在那里。
+// 实弹教训（2026-09-09 静态分析定案）：初版只扫 role=="user" 的消息，而
+// agent 式会话（一条人类消息 + 连续工具回合）的信封尾部全是 role:"tool"
+// 消息，断点永远钉在第一条人类消息 ≈ 静态前缀 —— 实测缓存封顶 ~38.5K、
+// 命中率随对话增长被稀释到 ~50%。必须从信封整体末尾回扫，位置才随对话
+// 前进；text-less 的纯工具轮有一轮迟滞，属可接受代价（cmdc 对非 text
+// part 上标记的接受度未实弹验证，不放上去赌）。
+func synthesizeCacheMarker(msgs []types.CcMessage, need, force bool, warns *[]string) {
 	if !need {
 		return
 	}
@@ -527,21 +551,17 @@ func synthesizeCacheMarker(msgs []types.CcMessage, need bool, warns *[]string) {
 			}
 		}
 	}
-	// 从后往前找最后一个 user 消息里的最后一个 text part。只落在 text part
-	// 上（PR#10 验证过的形状）；纯 tool_result 的收尾轮退回上一处文本，
-	// 该轮 tool_results 当轮不缓存、下一轮成为前缀后命中。
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role != "user" {
-			continue
-		}
 		for j := len(msgs[i].Content) - 1; j >= 0; j-- {
 			if msgs[i].Content[j].Type == "text" {
 				msgs[i].Content[j].CacheControl = &types.CacheControl{Type: "ephemeral"}
-				*warns = append(*warns,
-					"no part-level cache_control found on inbound messages; synthesized breakpoint on the last user text part (system/tools markers folded — the cmdc envelope has no fields to carry them). If the client is expected to send message-level markers (e.g. Claude Code), they are being stripped by an intermediate hop")
+				if !force {
+					*warns = append(*warns,
+						"no part-level cache_control found on inbound messages; synthesized breakpoint on the envelope tail's last text part (system/tools markers folded — the cmdc envelope has no fields to carry them). If the client is expected to send message-level markers (e.g. Claude Code), they are being stripped by an intermediate hop")
+				}
 				return
 			}
 		}
 	}
-	*warns = append(*warns, "cache_control present on system/tools but no user text part to carry the marker")
+	*warns = append(*warns, "cache_control present on system/tools but no text part to carry the marker")
 }

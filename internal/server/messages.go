@@ -50,6 +50,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		NodeVersion:        s.cfg.FakeNodeVersion,
 		WorkingDir:         masq.WorkingDirForSession(session),
 		AssistantReasoning: s.cfg.AssistantReasoning,
+		CacheMarkers:       s.cfg.CacheMarkers,
 	})
 	for _, wn := range warns {
 		// "info: " 前缀的是观测性信息（如断点透传落点），不算异常

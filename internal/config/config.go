@@ -24,6 +24,10 @@ type Config struct {
 	//                   派生稳定会话 ID（同一对话跨轮次复用，命中 prompt cache）
 	//   key            — 原版行为：每 key 12h+1h 抖动轮换
 	SessionStrategy string
+	// CacheMarkers 缓存断点策略：
+	//   respect（默认）— 客户端 part 级标记透传，缺失时末尾合成兜底
+	//   replace         — 剥掉客户端标记，强制末尾合成（A/B 诊断用）
+	CacheMarkers string
 	// AssistantReasoning 实验开关：把入站 assistant thinking 块以
 	// {type:"reasoning"} 回传上游（cmdc 的历史 reasoning 形状未实弹验证，
 	// 默认关闭即丢弃，与原版一致）。
@@ -44,6 +48,7 @@ func Load() Config {
 		IdleStream:        30 * time.Second,
 		IdleBuffer:        90 * time.Second,
 		SessionStrategy:   "prefix",
+		CacheMarkers:      "respect",
 		AssistantReasoning: false,
 		FakeNodeVersion:   "v22.21.0",
 	}
@@ -76,6 +81,9 @@ func Load() Config {
 	}
 	if v := os.Getenv("CC_SESSION_STRATEGY"); v == "key" || v == "prefix" {
 		c.SessionStrategy = v
+	}
+	if v := os.Getenv("CC_CACHE_MARKERS"); v == "respect" || v == "replace" {
+		c.CacheMarkers = v
 	}
 	if v := os.Getenv("CC_ASSISTANT_REASONING"); v == "1" {
 		c.AssistantReasoning = true

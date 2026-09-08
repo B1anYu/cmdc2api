@@ -366,6 +366,76 @@ func TestBuildCcRequest_CacheMarkerFallsBackPastToolResultTail(t *testing.T) {
 	}
 }
 
+// 静态分析定案的回归测试（2026-09-09）：agent 式会话的信封尾部是 role:"tool"
+// 消息，合成断点必须从信封整体末尾回扫（允许落在 assistant 的 text part 上），
+// 而不是只扫 user 消息 —— 否则断点钉在第一条人类消息 ≈ 静态前缀，
+// 实测缓存封顶 ~38.5K、命中率被稀释到 ~50%。
+func TestBuildCcRequest_CacheMarkerAdvancesThroughToolRounds(t *testing.T) {
+	req := parseReq(t, `{
+		"max_tokens": 100,
+		"system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "task"}]},
+			{"role": "assistant", "content": [
+				{"type": "text", "text": "checking"},
+				{"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+			]},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "res1"}]},
+			{"role": "assistant", "content": [
+				{"type": "text", "text": "found it"},
+				{"type": "tool_use", "id": "t2", "name": "f", "input": {}}
+			]},
+			{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "res2"}]}
+		]
+	}`)
+	cc, _ := BuildCcRequest(req, testOpts())
+	msgs := cc.Params.Messages
+	if len(msgs) != 5 {
+		t.Fatalf("messages = %d", len(msgs))
+	}
+	if m := msgs[0].Content[0]; m.CacheControl != nil {
+		t.Error("marker must NOT sit on the first human message (caps cache at static prefix)")
+	}
+	// 信封尾部是 tool 消息（无 text part）→ 断点落在全文最后的 text part，
+	// 即倒数第二条 assistant 消息的 "found it" —— 位置随工具回合前进
+	if m := msgs[3].Content[0]; m.CacheControl == nil || m.CacheControl.Type != "ephemeral" {
+		t.Errorf("marker must land on the last text part of the envelope (assistant text), got: %+v", m)
+	}
+}
+
+func TestBuildCcRequest_ReplaceMarkersStripsAndSynthesizesAtTail(t *testing.T) {
+	req := parseReq(t, `{
+		"max_tokens": 100,
+		"system": [{"type": "text", "text": "sys"}],
+		"messages": [
+			{"role": "user", "content": [{"type": "text", "text": "old turn", "cache_control": {"type": "ephemeral"}}]},
+			{"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+			{"role": "user", "content": [{"type": "text", "text": "new turn"}]}
+		]
+	}`)
+	opts := testOpts()
+	opts.CacheMarkers = "replace"
+	cc, warns := BuildCcRequest(req, opts)
+	msgs := cc.Params.Messages
+	// 客户端标记被剥掉
+	if m := msgs[0].Content[0]; m.CacheControl != nil {
+		t.Errorf("replace mode must strip inbound part-level markers: %+v", m)
+	}
+	// 强制在信封尾部合成
+	if m := msgs[2].Content[0]; m.CacheControl == nil || m.CacheControl.Type != "ephemeral" {
+		t.Errorf("replace mode must synthesize at the envelope tail: %+v", m)
+	}
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "CC_CACHE_MARKERS=replace stripped 1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("replace-mode strip should be logged, got %v", warns)
+	}
+}
+
 func TestPrefixCacheKey_StableWithinConversation(t *testing.T) {
 	turn1 := parseReq(t, `{
 		"system": "You are helpful.",
