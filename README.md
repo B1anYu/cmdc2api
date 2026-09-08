@@ -124,24 +124,12 @@ User-Agent, matching the Node CLI's outbound characteristics.
 - upstream usage semantics (whether `inputTokens` includes the cached bucket)
   are passed through as reported by the upstream reference implementation.
 
-## Comparison with commandcode-proxy
+## References
 
-Protocol knowledge comes from
+Protocol knowledge and the client-masquerade layer come from
 [commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) (MIT);
 conversion techniques draw on the `apicompat` package of
 [sub2api](https://github.com/Wei-Shaw/sub2api).
-
-| Aspect | commandcode-proxy (Node) | cmdc2api |
-|---|---|---|
-| Conversion path | Anthropic → OpenAI chat → cmdc (two stages) | Anthropic → cmdc direct |
-| User-message images | Silently dropped | base64 → data URI passthrough, URLs kept |
-| Images in tool_result | Text concatenated only | Relocated into a following user message |
-| cache_control | Lost on the Anthropic path | Part-level preserved/synthesized + session affinity |
-| Historical thinking blocks | Dropped | Dropped by default; `CC_ASSISTANT_REASONING=1` replays them |
-| Usage accounting | Estimated at +20 per tool call | Read from the upstream's totalUsage |
-| Device fingerprint | In-memory, lost on restart | Persisted to disk, stable |
-| Environment consistency | win32 fingerprint + Linux workingDir | Fully self-consistent win32 |
-| Deployment artifact | node:22-alpine container | Go static binary / minimal image |
 
 ## Development
 
@@ -164,6 +152,4 @@ This project is provided for learning and technical research purposes only.
 Users are responsible for ensuring that their use complies with applicable
 laws and regulations in their jurisdiction as well as the terms of any services
 involved. All consequences arising from the use of this project are borne by
-the user; the authors accept no liability. This project is an independent
-open-source implementation and is not affiliated with, or endorsed by, any of
-the projects or upstream services mentioned above.
+the user; the authors accept no liability.
