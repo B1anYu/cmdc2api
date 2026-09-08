@@ -10,12 +10,10 @@ import (
 	"time"
 )
 
-// 会话策略（对齐 proxy.mjs sessionStore/ensureSession/getSessionId + PR#10）：
-// 1. 客户端显式传入的 session 头优先（x-session-id / x-claude-code-session-id /
-//    session_id，≥8 字符），这是缓存亲和的显式通道；
-// 2. prefix 策略（默认）：从请求可缓存前缀派生稳定会话 ID —— 同一对话跨轮次
-//    复用同一会话，命中上游按会话粒度的 prompt cache（无状态，无轮换）；
-// 3. key 策略（原版行为）：按上游 key 隔离，12h + 1h 抖动轮换。
+// 会话策略：
+// 1. 客户端显式传入的 session 头优先（x-session-id / x-claude-code-session-id / session_id，长度 ≥ 8 字符）；
+// 2. prefix 策略（默认）：从请求可缓存前缀哈希派生稳定会话 ID，使同一对话跨轮次稳定复用会话以最大化命中 Prompt Cache；
+// 3. key 策略：按 API Key 隔离，按 12h + 1h 抖动周期轮换。
 const (
 	sessionDuration = 12 * time.Hour
 	sessionJitter   = time.Hour

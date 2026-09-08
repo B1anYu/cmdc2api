@@ -41,7 +41,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 会话亲和：显式 session 头 > 前缀派生（默认）/按 key 轮换
+	// 会话亲和解析：显式 session 请求头 > 前缀哈希派生（默认） > 按 Key 轮换
 	prefixKey := translate.PrefixCacheKey(&areq)
 	session := s.sessions.ResolveSession(r.Header, apiKey, prefixKey)
 
@@ -160,7 +160,7 @@ func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, body io.Rea
 		return // started：错误事件已在流内发出
 	}
 	if tr.OutputTokens() == 0 {
-		// 零输出按错误处理，避免下游异常计费；已开流时错误事件在 Finish 里
+		// 零输出转换为 429 错误处理，防止下游客户端异常计费；流已开启时在 Finish 中发出错误事件
 		cancel()
 		if !sw.started {
 			anthropicError(w, http.StatusTooManyRequests, "rate_limit_error",

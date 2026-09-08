@@ -27,7 +27,7 @@ func TestFakeProjectSlug_NonHexFallbackDeterministic(t *testing.T) {
 		t.Errorf("slug prefix wrong: %q", a)
 	}
 	if strings.Contains(a, "undefined") {
-		t.Errorf("slug must not contain 'undefined' (NaN bug from原版已修复): %q", a)
+		t.Errorf("slug must not contain 'undefined': %q", a)
 	}
 }
 
@@ -67,7 +67,7 @@ func TestSessionStore_HeaderPriority(t *testing.T) {
 	if got := s.ResolveSession(h2, "user_k", ""); got != "cc-session-12345" {
 		t.Errorf("claude-code session header must win, got %q", got)
 	}
-	// 过短的值不算（对齐原版 ≥8 字符规则）
+	// 长度小于 8 字符的 session header 视为无效，降级处理
 	h3 := http.Header{}
 	h3.Set("X-Session-Id", "short")
 	prefix := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"

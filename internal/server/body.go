@@ -18,9 +18,8 @@ import (
 
 var errBodyTooLarge = errors.New("body too large")
 
-// drainLimit 413 拒绝后排空请求体的上限：继续读取并丢弃，保持 keep-alive
-// 可复用，让客户端明确收到 413 而不是连接重置（上游 issue #7）；
-// 客户端无视 413 持续上传超过此上限则强制掐断。
+// drainLimit 413 请求体超限拒绝后的排空上限：继续读取并丢弃剩余部分以复用 keep-alive 连接，
+// 确保客户端能正常接收 413 响应而非连接被直接重置；若超额上传超过该上限则强制关闭。
 const drainLimit = 32 << 20
 
 type limitedReader struct {
@@ -81,8 +80,7 @@ func getAPIKey(h http.Header) string {
 
 // ---------- 上游空闲超时 ----------
 
-// idleReader 包装上游响应体：超过 idle 无新数据即关闭底层连接，把阻塞中的
-// Read 以 ErrIdleTimeout 唤醒。流式 30s / 非流式 90s（原版双档）。
+// idleReader 包装上游响应体：超时未收到新数据时主动断开连接，唤醒阻塞的 Read 并返回 ErrIdleTimeout（流式默认 30s / 非流式默认 90s）。
 var ErrIdleTimeout = errors.New("upstream idle timeout")
 
 type idleReader struct {
@@ -132,9 +130,8 @@ func (ir *idleReader) Close() error {
 
 // ---------- SSE 写出（延迟 200 头） ----------
 
-// sseWriter 延迟发送 200 头：事件先缓冲，确认有真实内容（text/thinking/
-// tool_use）后才写头刷出。这样超时/上游错误仍能以 JSON 状态码响应，
-// 客户端 SDK 会自动重试（原版核心手法）。
+// sseWriter 延迟发送 200 状态码与 SSE 响应头：在未确认产出实质内容（text/thinking/tool_use）前先缓冲事件。
+// 若首帧前发生超时或错误，可直接回退为标准 HTTP JSON 错误响应，便于客户端 SDK 进行退避重试。
 type sseWriter struct {
 	w       http.ResponseWriter
 	started bool

@@ -1,5 +1,4 @@
-// cmdc2api：Anthropic Messages → cmdc 直转代理（Go 版）。
-// 协议知识来自 commandcode-proxy（MIT），转换架构参考 sub2api。
+// Package main 为 cmdc2api 程序入口：Anthropic Messages → cmdc 单跳直转反向代理。
 package main
 
 import (

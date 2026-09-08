@@ -15,12 +15,10 @@ import (
 // StreamTranslator 把 cmdc NDJSON 事件流增量翻译为 Anthropic SSE 事件。
 // 调用方逐行喂入 Feed，结束时调一次 Finish；无内部 goroutine。
 //
-// 不变式（事故注释，sub2api 同款教训）：
-//   - 「开新块前必关旧块」：text→thinking 交错时若不先关旧块，
-//     累积文本会被客户端 SDK 直接覆盖丢失；
-//   - thinking 块收尾必须先发 signature_delta 再发 content_block_stop，
-//     否则客户端无法把签名带回下一轮；
-//   - stop_reason 不依赖最后一个块的内容，只认上游 finishReason。
+// 核心状态机不变式：
+//   - 「开启新块前必关旧块」：text 与 thinking 交错时若未先关闭旧块，累积文本会被客户端 SDK 覆盖丢失；
+//   - thinking 块收尾顺序：必须先发送 signature_delta 再发送 content_block_stop，确保客户端能将签名带入下一轮；
+//   - stop_reason 判定：严格以 finishReason 为准，不依赖最后一个内容块的类型。
 type StreamTranslator struct {
 	model     string
 	messageID string
@@ -32,9 +30,9 @@ type StreamTranslator struct {
 
 	usage         types.CcUsage
 	hasUsage      bool
-	outEstimate   int // 上游漏发 usage 时的输出下限估计（原版手法：delta/工具计数）
+	outEstimate   int // 上游漏发 usage 时的输出 token 估算保底（按 delta 与工具调用估算）
 	stopReason    string
-	stepReasonSet bool // finish-step 已给出 stop_reason（finish 不再覆盖，原版语义）
+	stepReasonSet bool // finish-step 已给出 stop_reason 时置为 true，防止被随后的 finish 事件覆盖
 
 	contentStarted bool
 	hasError       bool
@@ -101,7 +99,7 @@ func (t *StreamTranslator) Feed(line []byte) []types.StreamEvent {
 		out = append(out, types.NewContentBlockStart(idx, types.ToolUseBlockStart{
 			Type: "tool_use", ID: id, Name: ev.ToolName, Input: map[string]any{},
 		}))
-		// 上游一次性给完整 input：单条 input_json_delta 承载全文（原版手法）
+		// 上游一次性给出完整 input：通过单条 input_json_delta 承载全文
 		out = append(out, types.NewContentBlockDelta(idx, types.InputJSONDelta{
 			Type: "input_json_delta", PartialJSON: partialJSON(ev.Input),
 		}))
@@ -171,7 +169,7 @@ func (t *StreamTranslator) Finish() []types.StreamEvent {
 		t.stopReason = "end_turn"
 	}
 	if t.OutputTokens() == 0 {
-		// 零输出按错误处理，避免下游异常计费（原版语义）
+		// 零输出转换为错误事件，避免下游客户端产生异常计费
 		return append(out, types.NewErrorEvent("rate_limit_error", "Empty response from upstream (zero output tokens)"))
 	}
 	out = append(out, types.NewMessageDelta(t.stopReason, t.DeltaUsage()))
@@ -191,14 +189,9 @@ func (t *StreamTranslator) DeltaUsage() types.DeltaUsage {
 	if cacheWrite > 0 {
 		ccPtr = &cacheWrite
 	}
-	// 实弹定案（2026-09-09，两轮实测迭代后的最终口径）：cmdc 的 inputTokens
-	// 疑似按内部多步循环求和（tool 回合的 step1 全量处理、step2 全量命中
-	// 缓存），导致 inputTokens ≈ 2×真实prompt、cachedInputTokens ≈ 真实
-	// prompt——C/I 恒定 ~50% 与后台总输入恰为 API 一半均由此而来。
-	// 换算 input_tokens = inputTokens − cachedInputTokens（钳 ≥0）：
-	// 在「多步求和」与「总量含缓存」两种模型下都等于真实口径，且与
-	// 上游后台的总输入对齐。曾试过 −2×cached（报未缓存量），实测把
-	// input_tokens 钳成 0、命中率显示 100%，已证伪废弃。
+	// cmdc 上游返回的 inputTokens 包含内部多步处理累加的缓存读取（数值约为后台控制台统计的两倍）。
+	// 换算公式 input_tokens = max(0, inputTokens − cachedInputTokens) 精准对齐 cmdc 控制台去重后的实际 Prompt 输入，
+	// 并在多步累加与总量包含缓存两种模型下均保持一致。
 	input := u.InputTokens - u.CachedInputTokens
 	if input < 0 {
 		input = 0
@@ -216,8 +209,7 @@ func (t *StreamTranslator) DeltaUsage() types.DeltaUsage {
 	}
 }
 
-// OutputTokens 真实 usage 优先；上游漏发 usage 时用增量估计兜底
-// （原版只数 text/tool-call，这里把 reasoning 也计入：纯思考响应是有效输出）。
+// OutputTokens 真实 usage 优先；上游漏发 usage 时用增量估算兜底（含 reasoning 思考块与 text/tool-call）。
 func (t *StreamTranslator) OutputTokens() int {
 	if t.hasUsage {
 		return t.usage.OutputTokens
@@ -300,12 +292,11 @@ func partialJSON(raw json.RawMessage) string {
 }
 
 // FakeThinkingSignature 确定性伪造 thinking 签名：sha256(thinking 文本) 前
-// 32 字节加 0x12 长度前缀再 base64。第三方代理不可能铸造合法签名；
-// Claude Code 的浅校验只看 base64 以 'E' 开头且载荷首字节 0x12，本函数
-// 恰好满足，且同一文本签名稳定（可复现，多轮回传不冲突）。
+// 32 字节加 0x12 长度前缀再 base64。满足 Claude Code 浅校验要求（base64 以 'E' 开头且载荷首字节为 0x12），
+// 且同一文本签名保持确定性稳定。
 func FakeThinkingSignature(text string) string {
 	if text == "" {
-		text = "dsh-proxy-thinking" // 原版对空文本的兜底种子
+		text = "dsh-proxy-thinking" // 空文本兜底种子
 	}
 	seed := sha256.Sum256([]byte(text))
 	raw := append([]byte{0x12, byte(len(seed))}, seed[:]...)

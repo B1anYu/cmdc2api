@@ -13,8 +13,7 @@ import (
 	"github.com/B1anYu/cmdc2api/internal/masq"
 )
 
-// timeoutReduceContextThreshold 连续超时达到该次数后，错误消息提示压缩上下文
-// （原版经验：通常是上下文过长导致上游持续超时）。
+// timeoutReduceContextThreshold 连续超时达到该阈值后，返回包含缩减上下文提示的错误消息（通常为会话上下文过长引发）。
 const timeoutReduceContextThreshold = 3
 
 type Server struct {
@@ -54,7 +53,7 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte("OK"))
 }
 
-// middleware：CORS（对齐原版全开）、panic 恢复、请求日志。
+// middleware：跨域支持（CORS 全开）、panic 恢复与结构化请求日志。
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")

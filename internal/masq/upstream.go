@@ -17,8 +17,7 @@ import (
 	"github.com/B1anYu/cmdc2api/internal/types"
 )
 
-// Upstream 封装对 cmdc 的全部出站请求。请求头集合、预请求节奏、slug/traceparent
-// 生成规则均对齐 proxy.mjs 的可观察行为。
+// Upstream 封装对 cmdc 的全部出站请求（请求头构造、预请求节流、会话标识与链路追踪）。
 type Upstream struct {
 	base      string
 	zdr       bool
@@ -43,8 +42,8 @@ type Model struct {
 }
 
 func NewUpstream(base string, zdr bool, modelsTTL time.Duration, state *StateStore, ver *CCVersion) *Upstream {
-	// 真实 CLI 是 Node 程序，undici 默认走 HTTP/1.1；Go 默认协商 h2，
-	// 强制 http/1.1 对齐传输层指纹。User-Agent 置空同理（undici 不发 UA）。
+	// 官方 CLI 依赖 Node.js undici 客户端，默认使用 HTTP/1.1 且不发送 User-Agent。
+	// 此处强制 HTTP/1.1 并置空 User-Agent 以对齐传输层指纹。
 	transport := &http.Transport{
 		ForceAttemptHTTP2:     false,
 		TLSClientConfig:      &tls.Config{NextProtos: []string{"http/1.1"}},
@@ -75,9 +74,8 @@ func (u *Upstream) baseHeaders(apiKey string) http.Header {
 	return h
 }
 
-// EnsureInitialized 首次见到某 key（或距上次超过 8h+2h 抖动）时并行发出
-// fingerprint/record 与 lifecycle-events 两个预请求。失败不阻断主请求，
-// 下次请求重试。与原版一致：无论成败都推进节流时间。
+// EnsureInitialized 首次遇到某 key（或距上次执行超过 8h+2h 抖动周期）时并行发送
+// fingerprint/record 与 lifecycle-events 预请求。预请求失败不阻断主流程，执行后均推进节流时间。
 func (u *Upstream) EnsureInitialized(apiKey string) {
 	st := u.state.KeyState(apiKey)
 	if time.Now().Before(st.NextInitAt) {
@@ -103,7 +101,7 @@ func (u *Upstream) EnsureInitialized(apiKey string) {
 	lcBody, _ := json.Marshal(map[string]any{
 		"eventType": "cli_session_exists",
 		"metadata": map[string]any{
-			// 原版的 lifecycle sessionId 是每次随机的临时 ID，与 x-session-id 无关
+			// lifecycle sessionId 为单次预请求生成的独立临时 ID，与业务 session 无关
 			"sessionId":  "sess_" + NewHexID(8),
 			"cliVersion": u.versions.Get(),
 			"mode":       "interactive",
@@ -171,7 +169,7 @@ func (u *Upstream) Generate(ctx context.Context, apiKey, session string, inbound
 	return u.client.Do(req)
 }
 
-// Models 拉取上游模型列表，带 TTL 缓存；失败回退硬编码列表（原版行为）。
+// Models 拉取上游模型列表（带 TTL 内存缓存），请求失败时回退至内置兜底列表。
 func (u *Upstream) Models(apiKey string) []Model {
 	u.modelsMu.Lock()
 	if u.modelsCache != nil && time.Since(u.modelsAt) < u.modelsTTL {
@@ -226,9 +224,7 @@ var slugNames = []string{
 	"lib", "plugin", "proxy", "server", "service", "tool", "web", "worker",
 }
 
-// slugParts 按 sessionId 派生 (项目名, 后缀)。sessionId 前 4 字符按 16 进制
-// 解析（JS parseInt 语义：取前导合法十六进制位）；解析不出（如自定义
-// prompt-cache-key 风格的串）退化为确定性字符哈希。
+// slugParts 按 sessionId 派生 (项目名, 后缀)。尝试解析 sessionId 前导十六进制字符；若无法解析则降级为字符串哈希。
 func slugParts(sessionID string) (string, string) {
 	head := sessionID
 	if len(head) > 4 {
@@ -292,8 +288,7 @@ func FakeProjectSlug(sessionID string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-// WorkingDirForSession 生成与 slug 自洽的伪装工作目录（win32 风格路径，
-// 与指纹的 platform/arch 一致；原版发 Linux 的 process.cwd() 自相矛盾）。
+// WorkingDirForSession 生成与设备指纹 platform/arch（win32-x64）自洽的伪装工作目录。
 func WorkingDirForSession(sessionID string) string {
 	return fakeProjectPath(sessionID)
 }

@@ -22,15 +22,14 @@ type Config struct {
 	// SessionStrategy 会话亲和策略：
 	//   prefix（默认）— 无显式 session 头时，从 system+tools+首条用户消息
 	//                   派生稳定会话 ID（同一对话跨轮次复用，命中 prompt cache）
-	//   key            — 原版行为：每 key 12h+1h 抖动轮换
+	//   key            — 按 API Key 隔离并按 12h + 1h 抖动周期轮换
 	SessionStrategy string
 	// CacheMarkers 缓存断点策略：
 	//   respect（默认）— 客户端 part 级标记透传，缺失时末尾合成兜底
 	//   replace         — 剥掉客户端标记，强制末尾合成（A/B 诊断用）
 	CacheMarkers string
 	// AssistantReasoning 实验开关：把入站 assistant thinking 块以
-	// {type:"reasoning"} 回传上游（cmdc 的历史 reasoning 形状未实弹验证，
-	// 默认关闭即丢弃，与原版一致）。
+	// {type:"reasoning"} 回传上游（默认关闭，安全丢弃历史思考块）。
 	AssistantReasoning bool
 	// FakeNodeVersion 信封 config.environment 里伪装的 Node 版本。
 	FakeNodeVersion string

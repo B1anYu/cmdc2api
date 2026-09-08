@@ -1,7 +1,6 @@
-// Package types 定义线上协议类型：入站 Anthropic Messages、cmdc 信封与 NDJSON
-// 事件、代理回给客户端的 Anthropic SSE 事件与非流式消息。
-// 多态字段（system/content/tool_choice 等）用 json.RawMessage 保真，
-// 解析时先试 string 再试数组（sub2api 手法）。
+// Package types 定义线上协议类型：入站 Anthropic Messages、cmdc 信封与 NDJSON 事件、
+// 以及代理回给客户端的 Anthropic SSE 事件与非流式消息。
+// 多态字段（system/content/tool_choice 等）采用 json.RawMessage 保真，解析时依次兼容 string 与 block 数组。
 package types
 
 import "encoding/json"
@@ -173,8 +172,7 @@ type StopReasonBody struct {
 	StopSequence *string `json:"stop_sequence"`
 }
 
-// DeltaUsage message_delta 的 usage：input_tokens 是原版手法（message_start
-// 只能发 0，finish 才知道真实值，靠这里纠正 SDK 累积的最终消息）。
+// DeltaUsage 定义 message_delta 中的 usage：在流收尾时纠正全量 input_tokens 与缓存读取用量。
 type DeltaUsage struct {
 	OutputTokens             int   `json:"output_tokens"`
 	InputTokens              int   `json:"input_tokens"`

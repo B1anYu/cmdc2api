@@ -1,6 +1,5 @@
-// Package translate 实现协议转换：Anthropic Messages → cmdc 信封（请求直转，
-// 不经 OpenAI chat 中间层），cmdc NDJSON → Anthropic SSE/JSON（响应方向）。
-// 架构沿用 sub2api 的纯函数 + 状态机三段式，无 goroutine。
+// Package translate 实现协议转换：Anthropic Messages → cmdc 信封单跳直转，
+// 以及 cmdc NDJSON 流 → Anthropic SSE/JSON 响应转换。采用纯函数与无锁状态机设计。
 package translate
 
 import (
@@ -14,18 +13,18 @@ import (
 	"github.com/B1anYu/cmdc2api/internal/types"
 )
 
-// DefaultModel 请求未带 model 时的默认值（原版 buildCcRequest 默认）。
+// DefaultModel 请求未指定 model 时的兜底默认模型。
 const DefaultModel = "deepseek/deepseek-v4-flash"
 
 // BuildOpts 信封环境参数（由 handler 注入，随会话/时间变化）。
 type BuildOpts struct {
 	Now                time.Time
-	NodeVersion        string // 例 "v22.21.0"
+	NodeVersion        string // 伪装的 Node.js 版本（如 "v22.21.0"）
 	WorkingDir         string // win32 风格伪装路径，由会话派生
-	AssistantReasoning bool   // 实验开关：assistant thinking 块回传上游
-	// CacheMarkers 断点策略："" / "respect"（默认，客户端 part 级标记
-	// 透传，缺失才末尾合成）；"replace"（剥掉客户端标记，强制末尾合成，
-	// 用于 A/B 验证 cmdc 对客户端标记的消费语义）
+	AssistantReasoning bool   // 实验开关：将 assistant thinking 块回传上游
+	// CacheMarkers 缓存断点策略：
+	// "" / "respect"（默认：透传客户端 part 级标记，缺失时在末尾合成）；
+	// "replace"（剥除客户端标记，强制在末尾合成，用于诊断）。
 	CacheMarkers string
 }
 
@@ -57,8 +56,7 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		}
 	}
 
-	// CC_CACHE_MARKERS=replace（A/B 用）：剥掉全部入站 part 级标记，
-	// 断点一律由末尾合成 —— 用于验证 cmdc 对客户端原生标记的消费语义
+	// CC_CACHE_MARKERS=replace（诊断模式）：剥除全部入站 part 级标记并强制在末尾合成断点
 	replaceMarkers := opts.CacheMarkers == "replace"
 	if replaceMarkers {
 		stripped := 0
@@ -80,7 +78,7 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		if pm.role == "assistant" {
 			ccMsgs = append(ccMsgs, convertAssistant(pm, opts, &warns)...)
 		} else {
-			// user 及未知角色兜底为 user（对齐原版）
+			// user 及未知角色兜底按 user 处理
 			ccMsgs = append(ccMsgs, convertUser(pm, toolNames, &warns)...)
 		}
 	}
@@ -88,9 +86,7 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		warns = append(warns, "request produced no convertible messages")
 	}
 
-	// 断点可观测（info 级）：记录信封里实际存在的 part 级标记落点，
-	// 与 synthesizeCacheMarker 的告警互斥互补——两条日志二选一出现，
-	// 即可判定客户端断点是在透传还是中途丢失
+	// 记录信封中实际存在的 part 级 cache_control 标记位置，供排查缓存命中状态
 	var markerIdx []int
 	for i := range ccMsgs {
 		for _, p := range ccMsgs[i].Content {
@@ -158,9 +154,9 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 	return cc, warns
 }
 
-// PrefixCacheKey 从可缓存前缀（system + tools + 首条用户消息文本）派生
-// 稳定会话 ID。同一对话跨轮次前缀不变 → 同一会话 → 命中上游 prompt cache；
-// 前缀变化（如工具集变更、上下文压缩）时换会话，此时旧缓存本来也无法复用。
+// PrefixCacheKey 从可缓存前缀（system + tools + 首条用户消息文本）计算派生稳定会话 ID。
+// 同一对话的前缀在多轮交互中保持不变，确保命中上游按会话粒度的 Prompt Cache；
+// 当工具定义、系统提示词或首条消息发生压缩/变更时自动切换会话。
 func PrefixCacheKey(req *types.Request) string {
 	h := sha256.New()
 	sys, _ := parseSystem(req.System)
@@ -187,7 +183,7 @@ func PrefixCacheKey(req *types.Request) string {
 	}
 	_, _ = fmt.Fprintf(h, "first:%s", first)
 	sum := hex.EncodeToString(h.Sum(nil))
-	// UUID 形状（8-4-4-4-12），与真实 CLI 会话 ID 一致
+	// 格式化为 UUID 形状（8-4-4-4-12）
 	return sum[0:8] + "-" + sum[8:12] + "-" + sum[12:16] + "-" + sum[16:20] + "-" + sum[20:32]
 }
 
@@ -217,9 +213,8 @@ func parseBlocks(raw json.RawMessage) ([]types.Block, error) {
 	return blocks, nil
 }
 
-// parseSystem 解析 system（string | []block），返回拼接文本与是否携带
-// cache_control。cmdc 强制 system 为字符串，块结构与断点只能折算进
-// 会话亲和 + part 级缓存标记（synthesizeCacheMarker）。
+// parseSystem 解析 system 参数（支持 string 或 block 数组），返回拼接后的纯文本及是否包含 cache_control。
+// 由于 cmdc 强制要求 system 为字符串，结构化块上的缓存标记需合并并在末尾文本块合成。
 func parseSystem(raw json.RawMessage) (string, bool) {
 	if len(raw) == 0 {
 		return "", false
@@ -247,10 +242,9 @@ func parseSystem(raw json.RawMessage) (string, bool) {
 
 // ---------- user / assistant 转换 ----------
 
-// convertUser 把一条 Anthropic user 消息切分为 cmdc 消息序列：
-// text/image 块归 user 消息、tool_result 块归 tool 消息（1 part/条），
-// 保持块出现顺序；tool_result 内嵌图片并入紧随其后的 user 段
-// （cmdc 的 tool-result 只收文本，sub2api 同款媒体搬迁手法）。
+// convertUser 把 Anthropic user 消息转换为 cmdc 消息序列：
+// text/image 块归入 user 消息，tool_result 块转换为独立的 tool 消息。
+// 由于 cmdc 的 tool-result 仅支持文本，tool_result 内嵌的图片会自动提取并搬迁至后续 user 消息段中。
 func convertUser(pm *parsedMessage, toolNames map[string]string, warns *[]string) []types.CcMessage {
 	var out []types.CcMessage
 	var userParts []types.CcPart
@@ -284,8 +278,7 @@ func convertUser(pm *parsedMessage, toolNames map[string]string, warns *[]string
 			flushUser()
 			name, known := toolNames[b.ToolUseID]
 			if !known {
-				// 孤儿 tool_result（历史被裁剪/摘要后残留）：发送大概率被上游
-				// 拒收，丢弃并留痕（sub2api normalizeAnthropicToolPairing 手法）
+				// 历史记录被裁剪或压缩可能导致孤儿 tool_result（无对应 tool_use），丢弃并记录警告以避免上游校验失败
 				*warns = append(*warns, "orphan tool_result dropped (no matching tool_use in history): "+b.ToolUseID)
 				continue
 			}
@@ -331,7 +324,7 @@ func convertAssistant(pm *parsedMessage, opts BuildOpts, warns *[]string) []type
 			parts = append(parts, types.CcPart{Type: "text", Text: b.Text, CacheControl: ccCC(b.CacheControl)})
 		case "thinking":
 			if opts.AssistantReasoning {
-				// 实验路径：上游 reasoning part 的确切形状未实弹验证
+				// 实验特性：将思考块以 {type: "reasoning"} 格式转发上游
 				parts = append(parts, types.CcPart{Type: "reasoning", Text: b.Thinking})
 			} else {
 				thinkingDropped = true
@@ -444,8 +437,7 @@ func convertTools(tools []types.Tool, warns *[]string) ([]types.CcTool, bool) {
 	return out, hadCC
 }
 
-// normalizeSchema 兜底 schema：nil/非 object/缺 properties 一律补成
-// {"type":"object","properties":{}}，避免上游 400。
+// normalizeSchema 规范化工具 input_schema：确保为合法 object 且包含 properties 字段，防止上游 400 校验错误。
 func normalizeSchema(raw json.RawMessage) json.RawMessage {
 	def := json.RawMessage(`{"type":"object","properties":{}}`)
 	if len(raw) == 0 {
@@ -495,8 +487,7 @@ func convertToolChoice(raw json.RawMessage) (*types.CcToolChoice, *bool) {
 	return choice, parallel
 }
 
-// thinkingEffort Anthropic thinking → cmdc reasoning_effort。
-// 阈值对齐原版（LiteLLM 标准）：≥10000 high，≥5000 medium，>0 low。
+// thinkingEffort 将 Anthropic thinking 预算映射为 cmdc 的 reasoning_effort 档位（≥10000 为 high，≥5000 为 medium，>0 为 low）。
 func thinkingEffort(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -531,13 +522,9 @@ func thinkingEffort(raw json.RawMessage) string {
 
 // ---------- 缓存标记 ----------
 
-// synthesizeCacheMarker 在需要时把缓存断点合成到信封尾部：从最后一条消息
-// 的最后一个 part 往前找第一个 text part（PR#10 验证过的落点形状），把
-// {type:"ephemeral"} 打在那里。
-// 注意从信封整体末尾回扫而非只扫 user 消息：agent 式会话（一条人类消息 +
-// 连续工具回合）的信封尾部全是 role:"tool" 消息，只扫 user 会把断点钉在
-// 第一条人类消息上、位置永不前进。text-less 的纯工具轮有一轮迟滞，属可
-// 接受代价（cmdc 对非 text part 上标记的接受度未实弹验证，不放上去赌）。
+// synthesizeCacheMarker 当入站请求未包含内容级断点（或需要折算 system/tools 标记）时，在信封末尾合成缓存断点：
+// 从整条对话末尾向前回扫找到最后一个 text part 并附加 {type: "ephemeral"}。
+// 必须从信封整体末尾向前回扫（而非仅回溯 user 消息），以确保 Agent 多轮工具调用（role: "tool"）场景下断点能随对话历史前进。
 func synthesizeCacheMarker(msgs []types.CcMessage, need, force bool, warns *[]string) {
 	if !need {
 		return

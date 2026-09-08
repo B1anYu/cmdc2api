@@ -10,7 +10,7 @@ import (
 )
 
 // 上游状态码 → (对客户端状态码, Anthropic 错误类型, Retry-After 秒)。
-// 402 payment required → 429：让 SDK 自动退避重试（原版语义）。
+// 402 payment required 映射为 429 rate_limit_error 并附带 Retry-After，驱动客户端 SDK 自动退避重试。
 func MapStatus(ccStatus int) (status int, typ string, retryAfter int) {
 	switch ccStatus {
 	case 400:

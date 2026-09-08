@@ -1,6 +1,5 @@
 // Package masq 实现客户端伪装层：设备指纹、会话、CLI 版本号、
-// lifecycle 预请求与上游请求头。协议行为对齐 commandcode-proxy（proxy.mjs），
-// 这是上游「能跑」的根基，重写必须原样保留其可观察行为。
+// lifecycle 预请求与上游请求头构造。
 package masq
 
 import (
@@ -17,7 +16,7 @@ import (
 	"time"
 )
 
-// 仅 Windows x64 的 CPU 型号/核心数组合，来自真实 CLI 流量抓包。
+// Windows x64 平台的典型 CPU 型号与核心数组合。
 var fingerprintCPUs = []struct {
 	Model string
 	Cores int
@@ -48,7 +47,7 @@ var fingerprintTZs = []string{
 	"Australia/Sydney", "Pacific/Auckland",
 }
 
-// Fingerprint 与 /alpha/fingerprint/record 的请求体逐字段对应（proxy.mjs generateFingerprint）。
+// Fingerprint 与上游 /alpha/fingerprint/record 的请求体逐字段对应。
 type Fingerprint struct {
 	Thumbmark  string            `json:"thumbmark"`
 	Components FingerprintComps  `json:"components"`
@@ -86,7 +85,7 @@ func randHex(n int) string {
 }
 
 // GenerateFingerprint 随机生成一份自洽的 win32/x64 设备指纹。
-// thumbmark 是所有组件的联合哈希，上游可能校验其一致性，必须按原始算法拼串。
+// thumbmark 是所有组件的联合哈希，按特定规范拼接计算以满足上游指纹一致性校验。
 func GenerateFingerprint() Fingerprint {
 	cpu := fingerprintCPUs[mrand.IntN(len(fingerprintCPUs))]
 	memGiB := fingerprintMems[mrand.IntN(len(fingerprintMems))]
@@ -141,9 +140,8 @@ type keyState struct {
 	NextInitAt  time.Time    `json:"nextInitAt"`
 }
 
-// StateStore 把每 key 指纹持久化到磁盘：真机的指纹不会随进程重启而变化，
-// 原版存内存导致容器重启即换指纹 + 集中重发预请求，是一个伪装弱点。
-// 落盘键是 sha256(apiKey) 前缀，绝不把明文 key 写到磁盘。
+// StateStore 把每个 API Key 的设备指纹持久化到磁盘，确保重启后指纹保持连续稳定。
+// 索引键为 sha256(apiKey) 前缀，绝不持久化明文 Key。
 type StateStore struct {
 	mu   sync.Mutex
 	path string
