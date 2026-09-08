@@ -1,41 +1,73 @@
 # cmdc2api
 
-[English](README.md) | 简体中文
+English | [简体中文](README_zh.md)
 
 A direct-mapping proxy from the Anthropic Messages API to cmdc (Command Code).
 
-Written in Go with zero third-party dependencies, shipped as a static binary.
-Clients that speak the Anthropic protocol (CLI coding assistants and similar
-tools) connect to this proxy, which converts each request in a single hop to
-the cmdc envelope format and forwards it upstream — preserving images, thinking
-blocks, and cache markers — while reproducing the official CLI's client
-fingerprint at the request layer.
+Written in Go with **zero third-party dependencies**, shipped as a single static binary. Clients that speak the Anthropic protocol (such as Claude Code and other CLI coding assistants) connect to this proxy, which converts each request in a **single hop** to the cmdc envelope format and forwards it upstream — preserving multi-modal images, thinking blocks, and cache markers (`cache_control`) — while reproducing the official CLI's client fingerprint and behavioral characteristics at the transport layer.
+
+---
 
 ## Features
 
-- **Single-hop conversion** — Anthropic → cmdc in one step, no OpenAI chat intermediary
-- **Full image support** — user-message images (base64 / URL) pass through; images embedded in `tool_result` are automatically relocated
-- **Cache affinity** — `cache_control` markers preserved and synthesized, combined with stable session derivation for maximum prompt-cache hits
-- **Client masquerade** — device fingerprint, lifecycle pre-requests, live CLI version, OTel traceparent, transport-layer fingerprint alignment
-- **Streaming & non-streaming** — the upstream is always streamed; the proxy emits Anthropic SSE or aggregated JSON on demand, with identical semantics in both forms
-- **Accurate billing semantics** — usage read from the upstream's final totals; zero-output responses surface as 429 with `Retry-After` to prevent downstream mis-billing
+- **Single-hop Conversion** — Anthropic → cmdc in one step, bypassing intermediate OpenAI Chat translations to eliminate schema degradation and data loss.
+- **Full Multi-modal Support** — User-message images (base64 / URL) pass through natively; images embedded inside `tool_result` blocks are automatically relocated and reconstructed.
+- **Smart Cache Affinity** — Native `cache_control` markers preserved; tail cache breakpoints synthesized when missing; combined with stable prefix-derived sessions to maximize Prompt Cache hit rates.
+- **High-fidelity Client Masquerade** — Win32 x64 device fingerprint persistence, scheduled lifecycle pre-requests, dynamic npm CLI version synchronization, W3C traceparent headers, and transport-layer alignment (forced HTTP/1.1 with suppressed User-Agent).
+- **Streaming & Non-streaming Consistency** — Upstream is always streamed; an internal pure-function state machine emits Anthropic SSE or aggregated JSON on demand with identical data semantics.
+- **Accurate Billing & Anti-overcharge** — Token usage read from upstream totals with deduplicated cache accounting; zero-output abnormal responses surface as 429 with `Retry-After` to protect downstream billing.
+
+---
+
+## Architecture & Workflow
+
+```text
+Downstream Client (Claude Code / Anthropic SDK / CLI)
+                     │
+                     │ POST /v1/messages (Anthropic Messages API)
+                     ▼
+       ┌────────────────────────────────────────────────────────┐
+       │ cmdc2api Proxy                                         │
+       │  ├─ 1. Session Affinity (Header / Prefix Hash / Key)   │
+       │  ├─ 2. Masquerade Check (Win32 Fingerprint / Version)  │
+       │  ├─ 3. Single-hop Mapping (Req & Tail Cache Synthesis) │
+       │  └─ 4. Response State Machine (NDJSON → SSE / JSON)    │
+       └───────────────────────────┬────────────────────────────┘
+                                   │ Upstream HTTPS (HTTP/1.1, Empty UA, Win32 Headers)
+                                   ▼
+                     cmdc API (api.commandcode.ai)
+```
+
+---
 
 ## Quick Start
 
-Docker (recommended; linux/amd64 + arm64):
+### Method 1: Docker (Recommended)
+
+Pre-built multi-arch images (`linux/amd64` and `linux/arm64`):
 
 ```bash
 docker compose up -d   # ghcr.io/b1anyu/cmdc2api:latest
 ```
 
-Run from source:
+Or run directly with Docker:
+
+```bash
+docker run -d \
+  --name cmdc2api \
+  -p 8050:8050 \
+  -e HOST=0.0.0.0 \
+  -v $(pwd)/data:/app/data \
+  ghcr.io/b1anyu/cmdc2api:latest
+```
+
+### Method 2: Build from Source
 
 ```bash
 go build -o cmdc2api . && ./cmdc2api
 ```
 
-The server listens on `127.0.0.1:8050` by default. Authenticate with your cmdc
-account key, which is forwarded to the upstream unchanged:
+The server listens on `127.0.0.1:8050` by default. Authenticate using your cmdc account API Key, which is forwarded to the upstream unchanged:
 
 ```bash
 curl http://127.0.0.1:8050/v1/messages \
@@ -49,119 +81,114 @@ curl http://127.0.0.1:8050/v1/messages \
   }'
 ```
 
-## Endpoints
+---
 
-| Path | Description |
-|---|---|
-| `POST /v1/messages` | Anthropic Messages (streaming SSE + non-streaming JSON) |
-| `GET /v1/models` | Model list (forwarded upstream with a key; built-in fallback otherwise) |
-| `GET /health` | Health check |
+## Supported Endpoints
 
-Auth headers: `Authorization: Bearer user_xxx` or `x-api-key: user_xxx`.
+| Path | Method | Description |
+|---|---|---|
+| `/v1/messages` | `POST` | Anthropic Messages endpoint (streaming SSE & non-streaming JSON) |
+| `/v1/models` | `GET` | Model list (forwarded upstream when authenticated; built-in fallback otherwise) |
+| `/health` | `GET` | Health check endpoint |
 
-## Configuration (environment variables)
+**Authentication Headers**:
+- Supports `Authorization: Bearer user_xxx` or `x-api-key: user_xxx` headers.
+- Account API keys (typically in `user_xxx` format) are passed through to upstream cmdc unchanged without plaintext persistence.
+
+---
+
+## Configuration (Environment Variables)
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` / `HOST` | `8050` / `127.0.0.1` | Listen address (containers need `HOST=0.0.0.0`) |
-| `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL |
-| `CC_STATE_FILE` | `data/state.json` | Persistence path for the device fingerprint and lifecycle throttle state |
-| `CC_MAX_BODY_MB` | `100` | Inbound request body limit |
-| `CC_SESSION_STRATEGY` | `prefix` | Session strategy: `prefix` (stable per conversation) / `key` (per-key, 12h+1h rotation) |
-| `CC_CACHE_MARKERS` | `respect` | Cache breakpoints: `respect` (pass client markers through, synthesize at tail when absent) / `replace` (strip and force tail synthesis, diagnostic) |
-| `CC_ASSISTANT_REASONING` | `0` | Experimental: replay historical thinking blocks upstream as `{type:reasoning}` |
-| `CC_FAKE_NODE_VERSION` | `v22.21.0` | Node version reported in the envelope's `environment` field |
-| `CMD_ZDR` | `0` | Attach `x-cmd-zdr: 1` to route via ZDR only (also settable per request) |
-| `CC_MODEL_REFRESH` | `5m` | Model list cache duration |
+| `PORT` | `8050` | HTTP listening port |
+| `HOST` | `127.0.0.1` | HTTP listening address (use `0.0.0.0` in container environments) |
+| `CC_API_BASE` | `https://api.commandcode.ai` | cmdc upstream base API URL |
+| `CC_STATE_FILE` | `data/state.json` | Persistence path for device fingerprint and lifecycle throttle state |
+| `CC_MAX_BODY_MB` | `100` | Inbound request body limit (in MB) |
+| `CC_SESSION_STRATEGY` | `prefix` | Session strategy: `prefix` (stable per conversation, recommended) / `key` (per-key, 12h+1h rotation) |
+| `CC_CACHE_MARKERS` | `respect` | Cache breakpoint strategy: `respect` (pass client markers through, tail synthesis when absent) / `replace` (strip markers and force tail synthesis for diagnostics) |
+| `CC_ASSISTANT_REASONING` | `0` | Experimental: Replay historical thinking blocks upstream as `{type: "reasoning"}` |
+| `CC_FAKE_NODE_VERSION` | `v22.21.0` | Node.js version reported in envelope's `environment` field |
+| `CMD_ZDR` | `0` | Attach `x-cmd-zdr: 1` header globally (route via ZDR only; overridable per request) |
+| `CC_MODEL_REFRESH` | `5m` | In-memory cache duration for the model list |
 
-## Design Notes
+---
 
-### Conversion path
+## Design Details & Mechanics
 
-The cmdc envelope is already messages-flavored (block-array `content`, tools
-with `input_schema`, Anthropic-style `tool_choice`) — closest to the Anthropic
-protocol itself. This proxy therefore skips the Anthropic → OpenAI chat
-intermediate step entirely and maps request fields in one pass, avoiding the
-field loss inherent in a two-stage conversion.
+### 1. Single-hop Conversion Path
 
-### Cache affinity
+The cmdc envelope natively adheres to a messages-centric design (`content` as block arrays, tools defined with `input_schema`, Anthropic-style `tool_choice`), making it structurally closest to Anthropic's protocol. cmdc2api performs direct single-hop field mapping without an intermediate OpenAI Chat representation, preventing tool argument corruption and image block loss.
 
-cmdc's prompt cache works at session granularity. The proxy combines three
-mechanisms:
+### 2. Cache Affinity & Prompt Cache Optimization
 
-1. **Explicit session headers win**: inbound `x-session-id` /
-   `x-claude-code-session-id` / `session_id` (≥ 8 chars) are used as the
-   upstream session ID directly;
-2. **Prefix derivation** (default): with no explicit header, a stable
-   UUID-shaped session ID is derived from
-   `sha256(system + tools + first user message)` — the same conversation keeps
-   the same session across turns; when the prefix changes (tool set changes,
-   context compaction) the session rotates automatically;
-3. **Part-level cache markers**: `cache_control` on content blocks is kept in
-   place (normalized to `{type:"ephemeral"}`); markers on system / tools are
-   folded into a synthesized marker on the **envelope tail** — the breakpoint
-   is placed by scanning back from the very end of the conversation (across
-   message roles, including tool rounds), so it advances as the conversation
-   grows and the cache covers the full history except the newest turn.
-   `CC_CACHE_MARKERS=replace` strips client markers and forces tail synthesis
-   (diagnostic).
+cmdc's Prompt Cache operates at the session granularity. The proxy orchestrates three tiers of cache affinity:
 
-### Client masquerade
+1. **Explicit Session Headers**: If the request contains `x-session-id`, `x-claude-code-session-id`, or `session_id` (length ≥ 8), it is used directly as the upstream session ID.
+2. **Prefix Derivation (Default)**: In the absence of an explicit header, a stable UUID-formatted session ID is calculated from `sha256(system + tools + first_user_message)`. Conversations reuse the exact same upstream session across turns, automatically rotating only when system prompts, toolsets, or compressed contexts change.
+3. **Content-level & Tail Cache Breakpoints**:
+   - Native `cache_control` annotations on content blocks are preserved (normalized to `{type: "ephemeral"}`).
+   - Breakpoints on `system` and `tools` are folded into a synthesized marker on the **very last text part of the envelope** (scanned backwards from the entire conversation tail across tool turns), ensuring cached prefix coverage over all prior history.
 
-Mirrors the observable behavior of the official CLI: a Windows x64 device
-fingerprint (persisted, stable across restarts), pre-requests to
-`/alpha/fingerprint/record` and `/alpha/lifecycle-events` (throttled on an
-8h + 2h jittered schedule), the CLI version pulled live from npm into
-`x-command-code-version`, a per-session derived project slug, and a W3C
-traceparent. At the transport layer the proxy forces HTTP/1.1 and sends no
-User-Agent, matching the Node CLI's outbound characteristics.
+### 3. High-fidelity Client Masquerade
 
-### Known limitations
+Mirrors the observable characteristics of the official Node CLI:
+- **Fingerprint Continuity**: Persists generated Windows x64 device components to disk, avoiding anti-abuse triggers caused by frequent restarts.
+- **Lifecycle Heartbeats**: Periodically dispatches `/alpha/fingerprint/record` and `/alpha/lifecycle-events` requests on an 8h + 2h jittered schedule.
+- **Dynamic CLI Version**: Queries the npm registry every 24 hours to sync the latest release version into `x-command-code-version`.
+- **Transport Alignment**: Enforces HTTP/1.1 connections and suppresses the default Go `User-Agent` header to match Node.js `undici` client behavior.
 
-- cmdc requires `params.system` to be a string (arrays are rejected with 400);
-  block structure and cache breakpoints on system / tools go through the
-  folding path described above;
-- thinking signatures are deterministic forgeries (sha256 + 0x12 prefix): a
-  third-party proxy cannot mint real signatures, and this scheme satisfies
-  clients' shallow validation with a stable signature per text;
-- fields with no upstream equivalent are dropped: `stop_sequences`, `top_k`,
-  `metadata.user_id`, and `is_error` on tool results;
-- the upstream's `inputTokens` double-counts cached tokens across its
-  internal steps (confirmed against the upstream console: the console total
-  is exactly half of the API figure); the proxy reports
-  `input_tokens = inputTokens − cachedInputTokens` to match the console.
+### 4. Accurate Token Accounting
 
-## References
+Empirical verification revealed that cmdc upstream's `inputTokens` accumulates cached reads across internal loop steps (approximately 2× console totals). The proxy applies the normalized formula:
+$$\text{input\_tokens} = \max(0, \text{inputTokens} - \text{cachedInputTokens})$$
+This aligns with the actual deduplicated prompt counts reported in the cmdc web console.
 
-Protocol knowledge and the client-masquerade layer come from
-[commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) (MIT);
-conversion techniques draw on the `apicompat` package of
-[sub2api](https://github.com/Wei-Shaw/sub2api) (LGPL-3.0). cmdc2api itself is
-original code — no source from either project is included.
+---
 
-## License
+## Known Limitations & Fallbacks
 
-[MIT](LICENSE)
+- **System Prompt Format**: cmdc strictly enforces `params.system` as a plain string (array payloads are rejected with HTTP 400). Structured system blocks are concatenated into text, with cache markers mapped to the tail.
+- **Thinking Signature Deterministic Forgery**: Because third-party proxies cannot mint official cryptographic signatures, signatures are deterministically generated via `0x12` + sha256 prefix, ensuring stable signatures for identical thinking blocks while passing client-side shallow validation.
+- **Unsupported Inbound Fields**: Fields without upstream counterparts are safely dropped (e.g. `stop_sequences`, `top_k`, `metadata.user_id`, and `tool_result.is_error`).
 
-## Development
+---
+
+## Project Structure & Development
+
+```
+internal/
+├── config/       # Environment-driven runtime configuration
+├── errs/         # Error types and Anthropic error mapping
+├── masq/         # Client masquerading: fingerprint, session store, npm version, upstream client
+├── server/       # HTTP server layer: routes, CORS middleware, panic recovery, handlers
+├── translate/    # Core protocol conversion: request mapping, SSE streaming state machine, aggregation
+└── types/        # Protocol data structures (Anthropic inbound, cmdc envelopes & events)
+```
+
+Running tests locally:
 
 ```bash
-go test -race ./...   # unit + end-to-end tests (built-in fake upstream)
+go test -race ./...   # Unit & end-to-end tests (with built-in mock upstream)
 go vet ./...
 ```
 
-```
-internal/config     Configuration loading (environment variables only)
-internal/masq       Client masquerade: fingerprint/sessions/version/lifecycle/upstream client
-internal/types      Wire protocol types (Anthropic inbound, cmdc envelope & events, SSE events)
-internal/translate  Protocol conversion: request mapping, streaming state machine, aggregation
-internal/server     HTTP entrypoint: routing/middleware/error mapping
-```
+---
+
+## References & Acknowledgements
+
+- Protocol analysis and client masquerade mechanics inspired by [commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) (MIT).
+- Architecture techniques and streaming state-machine designs referenced from the `apicompat` package of [sub2api](https://github.com/Wei-Shaw/sub2api) (LGPL-3.0).
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+---
 
 ## Disclaimer
 
-This project is provided for learning and technical research purposes only.
-Users are responsible for ensuring that their use complies with applicable
-laws and regulations in their jurisdiction as well as the terms of any services
-involved. All consequences arising from the use of this project are borne by
-the user; the authors accept no liability.
+This project is provided for educational and technical research purposes only. Users are solely responsible for ensuring compliance with applicable laws, regulations, and third-party service terms. The authors assume no liability for any consequences arising from the use of this project.

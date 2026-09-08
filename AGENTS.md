@@ -1,92 +1,110 @@
-# cmdc2api 项目规则
+# cmdc2api 项目规则与开发指引
 
-## 项目定位
+## 一、 项目定位与参照
 
-Anthropic Messages → cmdc 直转代理（Go，零外部依赖，静态二进制）。
-仓库：github.com/B1anYu/cmdc2api（public，MIT，LICENSE 已附）。
-当前版本 v0.1.2（2026-09-09）。
-协议事实的权威参照是 `reference/commandcode-proxy/proxy.mjs`（MIT，行号基于
-commit `fcdb56a`）；转换架构手法参考 `reference/sub2api/backend/internal/pkg/apicompat`
-（sparse clone，LGPL-3.0，仅借鉴技法、未复制代码）。
+- **项目目标**：Anthropic Messages → cmdc 单跳直转反向代理（Go 编写，零第三方依赖，静态二进制部署）。
+- **当前版本**：`v0.1.2`（2026-09-09）。
+- **权威参照**：
+  - 协议事实与伪装标准：`reference/commandcode-proxy/proxy.mjs`（MIT，基于 commit `fcdb56a`）。
+  - 协议转换技法参考：`reference/sub2api/backend/internal/pkg/apicompat`（LGPL-3.0，仅借鉴架构手法，未复制代码）。
+- **`reference/` 目录隔离规则**：
+  - `reference/` 已加入 `.gitignore`，不入库。
+  - 新环境克隆方式：
+    ```bash
+    git clone https://github.com/MAXeaglet/commandcode-proxy.git reference/commandcode-proxy
+    git clone --filter=blob:none --sparse https://github.com/Wei-Shaw/sub2api.git reference/sub2api
+    git -C reference/sub2api sparse-checkout set backend/internal/pkg/apicompat
+    printf 'module github.com/Wei-Shaw/sub2api\n\ngo 1.24\n' > reference/sub2api/go.mod  # 隔离子树，勿删
+    ```
 
-**reference/ 不入库**（.gitignore），换机器后需重新获取：
+---
 
-```bash
-git clone https://github.com/MAXeaglet/commandcode-proxy.git reference/commandcode-proxy
-git clone --filter=blob:none --sparse https://github.com/Wei-Shaw/sub2api.git reference/sub2api
-git -C reference/sub2api sparse-checkout set backend/internal/pkg/apicompat
-printf 'module github.com/Wei-Shaw/sub2api\n\ngo 1.24\n' > reference/sub2api/go.mod  # 隔离子树，勿删
-```
+## 二、 安全红线
 
-## 环境与发布（2026-09-09 起开发迁移至 VPS）
+> [!CAUTION]
+> 本代理属于「高拟真客户端伪装」反向代理，存在上游风控封号风险：
+> - **实弹测试严禁用主号**：必须使用测试小号并在低频条件下验证。
+> - **测试前先验证存活**：确保测试账号本身未被上游封禁。
 
-- 开发、部署同在 VPS：push main → CI（vet / test -race / lint）+ GHCR `:dev` 双架构构建；
-  部署更新 = `docker compose pull && docker compose up -d`。
-- 发版：`git tag vX.Y.Z && git push origin vX.Y.Z`（**tag 单独 push**，与 paths-ignore
-  共存时混在普通 push 里可能被吞）→ `:latest` + `:X.Y.Z` + GitHub Release。
-- **`:latest` 只随 tag 更新，不跟 main**——VPS 若部署 `:latest`，有意义修复合入后
-  要及时打 tag，否则拉到的永远是旧版（v0.1.0~v0.1.1 间曾因忘打 tag 排查混乱）。
-  追 bleeding edge 用 `:dev`。
-- 纯文档/compose 改动已被两个 workflow 的 paths-ignore 自动跳过；临时跳过用 `[skip ci]`。
-- 指纹状态在部署目录 `data/state.json`：换部署位置时一并迁移，保指纹连续
-  （重启不变是刻意设计，频繁全换指纹是风控特征）。
+---
 
-## 安全红线
+## 三、 关键设计决策（核心不变式，勿轻易回退）
 
-- 「伪装官方客户端」反代，有上游风控封号风险：**实弹测试只用小号 + 低频，绝不用主号**，先验证账号存活。
+1. **鉴权机制与兼容性**：
+   - 客户端鉴权头兼容 `Authorization: Bearer user_xxx` 与 `x-api-key: user_xxx`。
+   - 鉴权 key（cmdc 格式通常为 `user_xxx`）原样透传给上游，代理本身不校验 key 的合法性。
+   - 明文 API Key 严禁写入日志或持久化磁盘（`data/state.json` 中仅以 `sha256(key)` 前缀为索引）。
+2. **单跳直转**：Anthropic 协议 → cmdc 信封一步完成，**坚决不引入 OpenAI Chat 中间层**，避免字段与类型丢失。
+3. **会话亲和优先级**：
+   - 优先级 1：显式 Session Header（`x-session-id` / `x-claude-code-session-id` / `session_id` ≥ 8 字符）；
+   - 优先级 2：前缀哈希派生（`CC_SESSION_STRATEGY=prefix`，默认）：`sha256(system + tools + 首条用户消息)`，同对话跨轮稳定；
+   - 优先级 3：Per-Key 轮换（`CC_SESSION_STRATEGY=key`，原版 12h + 1h 抖动轮换）。
+4. **Thinking 思考签名**：采用确定性伪造（`0x12` + sha256 前缀）满足下游客户端浅校验；上游不回传签名，历史记录中的签名发往上游时需过滤。
+5. **安全丢弃字段**（上游无对应能力，对齐原版行为）：
+   - `stop_sequences`、`top_k`、`metadata.user_id`、`tool_result.is_error`。
+6. **客户端伪装自洽性**：
+   - 指纹/Lifecycle/信封 Environment/WorkingDir 全套对齐 Windows x64。
+   - 出站 Transport 强制 `HTTP/1.1` 且置空 `User-Agent`（Go 中 `h.Set("User-Agent", "")` 可抑制默认 UA）。
+7. **Token Usage 换算**：`input_tokens = max(0, inputTokens − cachedInputTokens)`，严禁改回无脑透传（详见下节）。
 
-## 关键设计决策（勿轻易回退）
+---
 
-- 转换路径：Anthropic → cmdc 信封**单跳直转**，绝不引入 OpenAI chat 中间层。
-- 会话亲和优先级：显式 session 头 > 前缀派生（`CC_SESSION_STRATEGY=prefix`，默认，
-  `sha256(system+tools+首条用户消息)`，同对话跨轮稳定）> per-key 12h+1h 轮换（`=key`，原版行为）。
-- thinking 签名：确定性伪造（sha256+0x12 前缀，满足客户端浅校验）；上游不回传签名，
-  入站历史里的签名不发上游。
-- 丢弃字段（上游无对应能力，与原版一致）：`stop_sequences`、`top_k`、`metadata.user_id`、
-  tool_result 的 `is_error`。
-- 伪装自洽性：指纹/lifecycle/信封 environment/workingDir 全套 win32；upstream transport
-  强制 HTTP/1.1 + 空 User-Agent（`h.Set("User-Agent","")` 在 Go 中确实抑制该头，已实测）。
-- 状态（指纹/生命周期节流）落盘 `CC_STATE_FILE`，键为 sha256(key) 前缀，明文 key 绝不入盘。
-- usage 换算：`input_tokens = inputTokens − cachedInputTokens`（钳 ≥0），见下节，勿改回透传。
+## 四、 Usage 计费口径（2026-09-09 定案）
 
-## usage 口径（2026-09-09 定案，三轮实测迭代）
+### 1. 现象与实测
+- 上游 API 返回的 `cachedInputTokens / inputTokens` 比例恒定 $\approx 50\%$。
+- 相同请求在上游控制台记录的「总输入」正好为 API `inputTokens` 的一半（例如 80K vs 40K）。
 
-- **现象**：`cachedInputTokens / inputTokens` 恒定 ≈ 50%（跨对话跨版本稳定）；
-  同请求上游后台「总输入」≈ API `inputTokens` 的一半（80K vs 40K）。
-- **最自洽模型**：cmdc 内部多步循环按步求和 usage（step1 全量处理、step2 全量
-  命中缓存）→ I ≈ 2P、C ≈ P；后台按去重 prompt 计费。恒定 50%、后台减半、
-  以及 −2× 换算实测产出 input_tokens=0（已证伪废弃）均由此解释。
-- **最终口径**：`input_tokens = inputTokens − cachedInputTokens`——在「多步求和」
-  与「总量含缓存」两种模型下都等于真实口径，且与后台总输入对齐。抽验方法：
-  网关 `input_tokens` 应与 cmdc 后台总输入相等。
-- **教训**：换算公式必须保留被线上数据快速证伪回退的能力；命中率类指标先核对
-  分子分母口径，再动协议层（−1×→−2×→回退翻转了一次半）。
+### 2. 模型机理
+- cmdc 内部多步循环按步累加 usage（Step 1 全量处理产生 $P$、Step 2 全量命中缓存产生 $P$ 缓存读取）$\rightarrow$ $I \approx 2P, C \approx P$。
+- 上游后台按去重 Prompt 计费。
 
-## 缓存断点（结案）
+### 3. 定案公式
+$$\text{input\_tokens} = \max(0, \text{inputTokens} - \text{cachedInputTokens})$$
+- 在「多步求和」与「总量含缓存」两种模型下均等于真实消耗，且与上游后台总输入一致。
+- 抽验指标：网关 `input_tokens` 必须与 cmdc 后台总输入统计对齐。
 
-- 缓存行为正常：C ≈ P（恒定 50% 比值）恰是 step2 全量命中缓存的表现，非缺陷。
-- 合成断点从**信封整体末尾**回扫最后一个 text part（勿退回只扫 user 消息——
-  agent 链尾部全是 role:"tool" 消息，只扫 user 会钉死在第一条人类消息）。
-- 客户端 part 级标记透传优先（有则不合成）；`CC_CACHE_MARKERS=replace` 为备用
-  诊断旋钮（剥客户端标记 + 强制末尾合成），仅当下游显示再次异常时作 A/B。
-- 标记落点可观测：每请求二选一日志——`info: ... marker(s) present in envelope`
-  （透传）/ `WARN no part-level cache_control found`（合成兜底）。
-- 未验证：tool_result part 上挂标记是否被接受（现只落 text part）；`CC_ASSISTANT_REASONING=1`
-  的 `{type:reasoning}` 历史块上游是否接受（默认关闭即丢弃）。
+---
 
-## 已知陷阱
+## 五、 Prompt Cache 缓存断点机制
 
-- cmdc 强制 `params.system` 为字符串，数组直接 400 Validation error（真机验证过）。
-- `go vet ./...` 会扫进 `reference/sub2api`（其 sparse clone 不含自身 go.mod）：
-  克隆根已放一个空 go.mod 隔离该子树，勿删（新机器重取克隆后同样要放）。
-- cmdc 信封是 messages 风味而非 OpenAI chat：tool_choice 用 Anthropic 风味
-  `{type:auto|any|tool|none}`（含 `none`），tools 用 `input_schema`，content 恒为块数组。
-- CC CLI 版本号从 npm registry 每 24h 拉取（实测当前 1.50.1），fallback `1.50.1`。
-- Go 客户端默认行为会破坏伪装：net/http 默认协商 h2 且发 `Go-http-client` UA；
-  upstream transport 已强制 HTTP/1.1 + 空 UA，勿动。
+1. **缓存正常表现**：$C \approx P$（50% 比例）正是第二步全量命中缓存的正常表现，非缺陷。
+2. **断点合成位置**：从**信封整体末尾**向前回扫最后一个 `text` part（勿改回只扫 `user` 消息 —— Agent 交互链尾部常为 `role: "tool"`，只扫 user 会停滞在首条人类消息）。
+3. **客户端标记优先**：
+   - `CC_CACHE_MARKERS=respect`（默认）：优先透传客户端 part 级标记，仅在缺失时进行末尾合成。
+   - `CC_CACHE_MARKERS=replace`：剥离客户端标记并强制末尾合成（仅用于 A/B 诊断）。
+4. **断点可观测性**：
+   - 透传日志：`info: ... marker(s) present in envelope`
+   - 合成日志：`WARN: no part-level cache_control found`
 
-## 子智能体使用
+---
 
-- 简单/单点查询不派子智能体，主 agent 直接做；子智能体仅用于复杂或大规模并行探索。
-- 用户偏好：非复杂子任务希望用轻量（flash）模型。当前 Agent 工具无 model 参数无法指定，
-  若客户端未来支持按此执行。
+## 六、 环境与发版流水线
+
+- **开发与部署环境**：开发与部署均在 VPS。
+- **构建流**：`git push origin main` $\rightarrow$ GitHub Actions CI（vet / test -race / lint）+ GHCR `:dev` 双架构镜像。
+- **发版流**：
+  - 发版步骤：`git tag vX.Y.Z && git push origin vX.Y.Z`（**Tag 必须单独 push**，避免被 paths-ignore 吞掉）$\rightarrow$ 触发 GitHub Release 并发布 `:latest` 与 `:X.Y.Z` 镜像。
+  - **`:latest` 仅随 Tag 更新，不跟 `main`**。VPS 若部署 `:latest`，合入关键修复后务必打 Tag。
+- **状态迁移**：换机迁移时务必带上 `data/state.json`，确保设备指纹连续稳定。
+
+---
+
+## 七、 已知陷阱与避坑指南
+
+1. **System 参数类型**：cmdc 强制要求 `params.system` 为字符串，传入数组直接触发 `400 Validation error`。
+2. **Reference 子树隔离**：`reference/sub2api` 根目录的空 `go.mod` 用于阻止 `go vet ./...` 递归扫描，不可删除。
+3. **cmdc 信封格式**：
+   - `tool_choice` 使用 Anthropic 风格 `{type: "auto"|"any"|"tool"|"none"}`（包含 `none`）。
+   - `tools` 字段使用 `input_schema`。
+   - `content` 恒为块数组。
+4. **CLI 版本动态获取**：CC CLI 版本号每 24h 从 npm registry 动态同步（fallback `1.50.1`）。
+5. **Go 默认 HTTP 行为**：Go `net/http` 默认协商 HTTP/2 且携带 `Go-http-client` UA，必须在 Transport 强制 `HTTP/1.1` 并显式抑制 UA。
+
+---
+
+## 八、 智能体协作指引
+
+- **任务原则**：简单、单点查询由主 Agent 直接执行；子智能体仅用于大规模并行探索或深层调研。
+- **模型偏好**：若使用子智能体，非复杂任务优先使用轻量（flash）模型以节省资源。
+
