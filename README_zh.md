@@ -97,7 +97,12 @@ cmdc 的 prompt cache 按会话粒度工作。本代理三层配合：
 ## References
 
 协议知识与客户端伪装来自 [commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy)（MIT），
-转换架构手法参考 [sub2api](https://github.com/Wei-Shaw/sub2api) 的 `apicompat` 包。
+转换架构手法参考 [sub2api](https://github.com/Wei-Shaw/sub2api)（LGPL-3.0）的 `apicompat` 包。
+cmdc2api 本身为原创代码，未包含上述任一项目的源码。
+
+## License
+
+[MIT](LICENSE)
 
 ## 开发
 

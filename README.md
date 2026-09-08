@@ -129,7 +129,12 @@ User-Agent, matching the Node CLI's outbound characteristics.
 Protocol knowledge and the client-masquerade layer come from
 [commandcode-proxy](https://github.com/MAXeaglet/commandcode-proxy) (MIT);
 conversion techniques draw on the `apicompat` package of
-[sub2api](https://github.com/Wei-Shaw/sub2api).
+[sub2api](https://github.com/Wei-Shaw/sub2api) (LGPL-3.0). cmdc2api itself is
+original code — no source from either project is included.
+
+## License
+
+[MIT](LICENSE)
 
 ## Development
 
