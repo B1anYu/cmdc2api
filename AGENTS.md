@@ -4,6 +4,7 @@
 
 Anthropic Messages → cmdc 直转代理（Go，零外部依赖，静态二进制）。
 仓库：github.com/B1anYu/cmdc2api（public，MIT，LICENSE 已附）。
+当前版本 v0.1.2（2026-09-09）。
 协议事实的权威参照是 `reference/commandcode-proxy/proxy.mjs`（MIT，行号基于
 commit `fcdb56a`）；转换架构手法参考 `reference/sub2api/backend/internal/pkg/apicompat`
 （sparse clone，LGPL-3.0，仅借鉴技法、未复制代码）。
@@ -23,6 +24,9 @@ printf 'module github.com/Wei-Shaw/sub2api\n\ngo 1.24\n' > reference/sub2api/go.
   部署更新 = `docker compose pull && docker compose up -d`。
 - 发版：`git tag vX.Y.Z && git push origin vX.Y.Z`（**tag 单独 push**，与 paths-ignore
   共存时混在普通 push 里可能被吞）→ `:latest` + `:X.Y.Z` + GitHub Release。
+- **`:latest` 只随 tag 更新，不跟 main**——VPS 若部署 `:latest`，有意义修复合入后
+  要及时打 tag，否则拉到的永远是旧版（v0.1.0~v0.1.1 间曾因忘打 tag 排查混乱）。
+  追 bleeding edge 用 `:dev`。
 - 纯文档/compose 改动已被两个 workflow 的 paths-ignore 自动跳过；临时跳过用 `[skip ci]`。
 - 指纹状态在部署目录 `data/state.json`：换部署位置时一并迁移，保指纹连续
   （重启不变是刻意设计，频繁全换指纹是风控特征）。
@@ -43,48 +47,32 @@ printf 'module github.com/Wei-Shaw/sub2api\n\ngo 1.24\n' > reference/sub2api/go.
 - 伪装自洽性：指纹/lifecycle/信封 environment/workingDir 全套 win32；upstream transport
   强制 HTTP/1.1 + 空 User-Agent（`h.Set("User-Agent","")` 在 Go 中确实抑制该头，已实测）。
 - 状态（指纹/生命周期节流）落盘 `CC_STATE_FILE`，键为 sha256(key) 前缀，明文 key 绝不入盘。
+- usage 换算：`input_tokens = inputTokens − cachedInputTokens`（钳 ≥0），见下节，勿改回透传。
 
-## 待实弹验证（小号低频，不阻塞开发）
+## usage 口径（2026-09-09 定案，三轮实测迭代）
 
-1. `CC_ASSISTANT_REASONING=1` 时 `{type:reasoning}` assistant 历史块上游是否接受
-   （形状是推测的，默认关闭即丢弃）。
+- **现象**：`cachedInputTokens / inputTokens` 恒定 ≈ 50%（跨对话跨版本稳定）；
+  同请求上游后台「总输入」≈ API `inputTokens` 的一半（80K vs 40K）。
+- **最自洽模型**：cmdc 内部多步循环按步求和 usage（step1 全量处理、step2 全量
+  命中缓存）→ I ≈ 2P、C ≈ P；后台按去重 prompt 计费。恒定 50%、后台减半、
+  以及 −2× 换算实测产出 input_tokens=0（已证伪废弃）均由此解释。
+- **最终口径**：`input_tokens = inputTokens − cachedInputTokens`——在「多步求和」
+  与「总量含缓存」两种模型下都等于真实口径，且与后台总输入对齐。抽验方法：
+  网关 `input_tokens` 应与 cmdc 后台总输入相等。
+- **教训**：换算公式必须保留被线上数据快速证伪回退的能力；命中率类指标先核对
+  分子分母口径，再动协议层（−1×→−2×→回退翻转了一次半）。
 
-## usage 语义定案（2026-09-09，三轮实测迭代后收口）
+## 缓存断点（结案）
 
-- **现象**：`cachedInputTokens / inputTokens` 恒定 ≈ 50%（49.2~50.0%，跨
-  对话、跨版本稳定）；同一请求上游后台「总输入（缓存+未缓存）」≈ API
-  `inputTokens` 的一半（80K vs 40K）。
-- **最自洽模型**：cmdc 内部跑多步循环（tool 回合 step1 全量处理、step2
-  全量命中缓存），`totalUsage` 按步求和 → I ≈ 2P、C ≈ P、C/I ≡ 50%；
-  后台按去重后的真实 prompt 计费。该模型同时解释恒定比例、后台减半、
-  以及 −2× 换算实测产出 input_tokens=0/命中率 100%（已证伪废弃）。
-- **最终口径**：`input_tokens = inputTokens − cachedInputTokens`（钳 ≥0）
-  ——在「多步求和」与「总量含缓存」两种模型下都等于真实口径，且与后台
-  总输入对齐。
-- **教训（两次方向性翻转）**：−1× → −2× 的依据是「与正常渠道形状对照」，
-  但正常渠道 98% 命中 vs cmdc 恒定 50% 本身可能就是口径差异而非行为差异；
-  −2× 上线后立刻被 0/100% 证伪。**换算公式必须能被线上数据证伪时快速
-  回退——这次靠的正是这一点。**
-- 复盘注：缓存排查初期「命中率 ~50%」的恐慌也源于此口径问题，缓存本身
-  行为正常（C ≈ P 恰是 step2 全量命中的表现）；断点落点修复保留，属于
-  合成路径的正确加固。
-
-## 缓存与 usage 排查复盘（2026-09-08/09，结案）
-
-- **最终定案以「usage 语义定案」节为准**：缓存一直正常（真实命中率 96~99.9%），
-  「命中率 ~50%、cache_read 封顶 ~38.5K」是 cmdc `inputTokens` 重复计入缓存
-  读取导致的网关显示假象，已由 usage 换算修复。
-- 复盘教训：排查初期把显示假象误判为「断点钉死在静态前缀」，沿这条线做了
-  两次断点位置修复 + 一轮静态分析，均为无效方向（对生产流量是空操作）。
-  教训：**命中率类指标先核对分子分母的口径，再动协议层**。
-- 排查线的实际留存收益（保留）：① 合成断点改为从信封整体末尾回扫——修掉
-  合成路径的一个真实潜在缺陷（agent 链中断点永不前进），虽然生产中合成
-  路径从未触发；② 标记落点可观测日志（info/WARN 二选一）；③ 断点落点
-  回归测试。
-- `CC_CACHE_MARKERS=replace`：备用诊断旋钮（剥客户端标记 + 强制末尾合成）。
-  其预设使用前提（「信封含标记但缓存仍封顶」）已随定案消失，仅当下游
-  显示再次异常时作为 A/B 手段。
-- 未验证：tool_result part 上挂标记是否被接受（现只落在 text part 上）。
+- 缓存行为正常：C ≈ P（恒定 50% 比值）恰是 step2 全量命中缓存的表现，非缺陷。
+- 合成断点从**信封整体末尾**回扫最后一个 text part（勿退回只扫 user 消息——
+  agent 链尾部全是 role:"tool" 消息，只扫 user 会钉死在第一条人类消息）。
+- 客户端 part 级标记透传优先（有则不合成）；`CC_CACHE_MARKERS=replace` 为备用
+  诊断旋钮（剥客户端标记 + 强制末尾合成），仅当下游显示再次异常时作 A/B。
+- 标记落点可观测：每请求二选一日志——`info: ... marker(s) present in envelope`
+  （透传）/ `WARN no part-level cache_control found`（合成兜底）。
+- 未验证：tool_result part 上挂标记是否被接受（现只落 text part）；`CC_ASSISTANT_REASONING=1`
+  的 `{type:reasoning}` 历史块上游是否接受（默认关闭即丢弃）。
 
 ## 已知陷阱
 
