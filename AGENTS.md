@@ -3,7 +3,7 @@
 ## 项目定位
 
 Anthropic Messages → cmdc 直转代理（Go，零外部依赖，静态二进制）。
-协议事实的唯一权威参照是 `reference/commandcode-proxy/proxy.mjs`（MIT，行号基于
+协议事实的权威参照是 `reference/commandcode-proxy/proxy.mjs`（MIT，行号基于
 commit `fcdb56a`）；转换架构手法参考 `reference/sub2api/backend/internal/pkg/apicompat`
 （sparse clone）。两个克隆已 .gitignore，仅本地参考，不随仓库分发。
 

@@ -38,7 +38,7 @@ func (c *CCVersion) Start() {
 			slog.Warn("cc version fetch failed, using current", "version", c.Get(), "error", err)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode != 200 {
 			slog.Warn("cc version fetch non-200", "status", resp.StatusCode)
 			return

@@ -133,7 +133,7 @@ func (u *Upstream) EnsureInitialized(apiKey string) {
 				slog.Warn("init request error", "what", job.what, "error", err)
 				return
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 16<<10))
 			if resp.StatusCode >= 400 {
 				slog.Warn("init request failed", "what", job.what, "status", resp.StatusCode)
@@ -194,7 +194,7 @@ func (u *Upstream) Models(apiKey string) []Model {
 		slog.Warn("models fetch error, using fallback", "error", err)
 		return FallbackModels
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		slog.Warn("models fetch non-200, using fallback", "status", resp.StatusCode)
 		return FallbackModels

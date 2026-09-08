@@ -75,7 +75,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		anthropicError(w, http.StatusBadGateway, "api_error", "Upstream error: "+err.Error(), 0)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -89,7 +89,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		idle = s.cfg.IdleBuffer
 	}
 	upstreamBody := newIdleReader(resp.Body, idle)
-	defer upstreamBody.Close()
+	defer func() { _ = upstreamBody.Close() }()
 
 	tr := translate.NewStreamTranslator(model, messageID)
 	if areq.Stream {
