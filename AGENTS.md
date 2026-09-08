@@ -3,9 +3,29 @@
 ## 项目定位
 
 Anthropic Messages → cmdc 直转代理（Go，零外部依赖，静态二进制）。
+仓库：github.com/B1anYu/cmdc2api（public，MIT，LICENSE 已附）。
 协议事实的权威参照是 `reference/commandcode-proxy/proxy.mjs`（MIT，行号基于
 commit `fcdb56a`）；转换架构手法参考 `reference/sub2api/backend/internal/pkg/apicompat`
-（sparse clone）。两个克隆已 .gitignore，仅本地参考，不随仓库分发。
+（sparse clone，LGPL-3.0，仅借鉴技法、未复制代码）。
+
+**reference/ 不入库**（.gitignore），换机器后需重新获取：
+
+```bash
+git clone https://github.com/MAXeaglet/commandcode-proxy.git reference/commandcode-proxy
+git clone --filter=blob:none --sparse https://github.com/Wei-Shaw/sub2api.git reference/sub2api
+git -C reference/sub2api sparse-checkout set backend/internal/pkg/apicompat
+printf 'module github.com/Wei-Shaw/sub2api\n\ngo 1.24\n' > reference/sub2api/go.mod  # 隔离子树，勿删
+```
+
+## 环境与发布（2026-09-09 起开发迁移至 VPS）
+
+- 开发、部署同在 VPS：push main → CI（vet / test -race / lint）+ GHCR `:dev` 双架构构建；
+  部署更新 = `docker compose pull && docker compose up -d`。
+- 发版：`git tag vX.Y.Z && git push origin vX.Y.Z`（**tag 单独 push**，与 paths-ignore
+  共存时混在普通 push 里可能被吞）→ `:latest` + `:X.Y.Z` + GitHub Release。
+- 纯文档/compose 改动已被两个 workflow 的 paths-ignore 自动跳过；临时跳过用 `[skip ci]`。
+- 指纹状态在部署目录 `data/state.json`：换部署位置时一并迁移，保指纹连续
+  （重启不变是刻意设计，频繁全换指纹是风控特征）。
 
 ## 安全红线
 
@@ -32,27 +52,29 @@ commit `fcdb56a`）；转换架构手法参考 `reference/sub2api/backend/intern
 2. `CC_ASSISTANT_REASONING=1` 时 `{type:reasoning}` assistant 历史块上游是否接受
    （形状是推测的，默认关闭即丢弃）。
 
-## 缓存实弹结论（2026-09-08）
+## 缓存实弹结论与在途排查（2026-09-08/09）
 
-- part 级 `cache_control` **确实被上游作为缓存断点**：实测缓存读取恒定封顶在
-  合成标记位置（≈ 静态前缀体量），随对话增长命中率被稀释到 ~50%。
-- 合成标记位置已从「第一条 user 消息」（PR#10 原位）移到「最后一条 user 消息的
-  末尾 text part」—— 断点跟随对话末尾，缓存应覆盖除最近一轮外全部历史。
+- 实测（~78-83K 输入的长对话）：缓存读取恒定封顶 ≈ 静态前缀（~38.5K），命中率被
+  稀释到 ~50%。合成标记位置已从「第一条 user 消息」（PR#10 原位）移到「最后一条
+  user 消息的末尾 text part」。
+- **定案手段已部署**：每请求二选一日志——`info: N inbound part-level cache_control
+  marker(s) passed through...`（客户端断点在透传）/ `WARN no part-level cache_control
+  found on inbound messages...`（断点丢失、合成兜底）。用户确认 axonhub 透传，
+  若日志显示兜底在生效则矛盾待查；若显示透传且缓存仍封顶 → 是 cmdc 对客户端标记的
+  消费语义问题，下一步加 `CC_CACHE_MARKERS=replace`（剥客户端标记 + 末尾强制合成）做 A/B。
 - 未验证：tool_result part 上挂标记是否被接受（现只落在 text part 上，
   纯 tool_result 收尾的轮次回退到上一处文本，当轮尾部不缓存）。
-- 断点控制权归属：客户端消息级断点到达即透传且不合成（hasMarker 优先）；
-  合成仅在入站消息级断点缺失时兜底。实测兜底在唯一生效 → Claude Code 的
-  消息级断点疑似被中间跳（axonhub）剥离；合成发生时会打 WARN，含
-  "no part-level cache_control found on inbound messages"，tail 日志即可定案。
 
 ## 已知陷阱
 
 - cmdc 强制 `params.system` 为字符串，数组直接 400 Validation error（真机验证过）。
 - `go vet ./...` 会扫进 `reference/sub2api`（其 sparse clone 不含自身 go.mod）：
-  克隆根已放一个空 go.mod 隔离该子树，勿删。
+  克隆根已放一个空 go.mod 隔离该子树，勿删（新机器重取克隆后同样要放）。
 - cmdc 信封是 messages 风味而非 OpenAI chat：tool_choice 用 Anthropic 风味
   `{type:auto|any|tool|none}`（含 `none`），tools 用 `input_schema`，content 恒为块数组。
 - CC CLI 版本号从 npm registry 每 24h 拉取（实测当前 1.50.1），fallback `1.50.1`。
+- Go 客户端默认行为会破坏伪装：net/http 默认协商 h2 且发 `Go-http-client` UA；
+  upstream transport 已强制 HTTP/1.1 + 空 UA，勿动。
 
 ## 子智能体使用
 
