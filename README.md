@@ -63,8 +63,6 @@ cmdc 的 prompt cache 按会话粒度工作（上游 PR#10 把 `prompt_cache_key
 docker compose up -d   # ghcr.io/b1anyu/cmdc2api:latest，双架构 amd64/arm64
 ```
 
-接 axonhub：渠道类型 `anthropic`，base_url `http://cmdc2api:3050`（挂 `axonhub_default` 网络），渠道 key 填 cmdc 的 `user_` key。
-
 本地裸跑：
 
 ```bash

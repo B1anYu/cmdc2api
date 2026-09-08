@@ -16,10 +16,3 @@ services:
       # CC_ASSISTANT_REASONING: "1"   # 实验开关，见 README
     volumes:
       - ./data:/data
-    # 接 axonhub：解开下行注释并确保该网络存在
-    # networks:
-    #   - axonhub_default
-
-# networks:
-#   axonhub_default:
-#     external: true
