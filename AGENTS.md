@@ -52,18 +52,22 @@ printf 'module github.com/Wei-Shaw/sub2api\n\ngo 1.24\n' > reference/sub2api/go.
 2. `CC_ASSISTANT_REASONING=1` 时 `{type:reasoning}` assistant 历史块上游是否接受
    （形状是推测的，默认关闭即丢弃）。
 
-## 缓存实弹结论与在途排查（2026-09-08/09）
+## 缓存实弹结论与排查（2026-09-08/09，已定案）
 
 - 实测（~78-83K 输入的长对话）：缓存读取恒定封顶 ≈ 静态前缀（~38.5K），命中率被
-  稀释到 ~50%。合成标记位置已从「第一条 user 消息」（PR#10 原位）移到「最后一条
-  user 消息的末尾 text part」。
-- **定案手段已部署**：每请求二选一日志——`info: N inbound part-level cache_control
-  marker(s) passed through...`（客户端断点在透传）/ `WARN no part-level cache_control
-  found on inbound messages...`（断点丢失、合成兜底）。用户确认 axonhub 透传，
-  若日志显示兜底在生效则矛盾待查；若显示透传且缓存仍封顶 → 是 cmdc 对客户端标记的
-  消费语义问题，下一步加 `CC_CACHE_MARKERS=replace`（剥客户端标记 + 末尾强制合成）做 A/B。
-- 未验证：tool_result part 上挂标记是否被接受（现只落在 text part 上，
-  纯 tool_result 收尾的轮次回退到上一处文本，当轮尾部不缓存）。
+  稀释到 ~50%，缓慢爬升（38,528→41,344）= 用户偶尔发新文本使断点前跳。
+- **静态分析定案根因（2026-09-09）**：synthesizeCacheMarker 原来只扫 role=="user"
+  的消息，而 agent 式会话（一条人类消息 + 连续工具回合）的信封尾部全是 role:"tool"
+  消息——断点永远钉在第一条人类消息 ≈ 静态前缀。此前两次「移到最后一条 user
+  消息」的修复在 agent 链里是空操作（最后一条 user 消息就是第一条）。
+  **已修**：从信封整体末尾回扫最后一个 text part（含 assistant 文本，位置随工具
+  回合前进）；纯 tool_result 轮有一轮迟滞（非 text part 标记接受度未实弹验证，不赌）。
+- **A/B 旋钮已备**：`CC_CACHE_MARKERS=replace`（剥全部入站 part 级标记 + 强制末尾
+  合成）。若修复部署后日志显示「信封含标记但缓存仍封顶」→ 是 cmdc 对客户端标记
+  的消费语义问题，翻这个开关对比。标记落点可观测：每请求二选一日志——
+  `info: ... marker(s) present in envelope`（透传在生效）/ `WARN no part-level
+  cache_control found`（合成兜底在生效）。
+- 未验证：tool_result part 上挂标记是否被接受（现只落在 text part 上）。
 
 ## 已知陷阱
 

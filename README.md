@@ -68,6 +68,7 @@ Auth headers: `Authorization: Bearer user_xxx` or `x-api-key: user_xxx`.
 | `CC_STATE_FILE` | `data/state.json` | Persistence path for the device fingerprint and lifecycle throttle state |
 | `CC_MAX_BODY_MB` | `100` | Inbound request body limit |
 | `CC_SESSION_STRATEGY` | `prefix` | Session strategy: `prefix` (stable per conversation) / `key` (per-key, 12h+1h rotation) |
+| `CC_CACHE_MARKERS` | `respect` | Cache breakpoints: `respect` (pass client markers through, synthesize at tail when absent) / `replace` (strip and force tail synthesis, diagnostic) |
 | `CC_ASSISTANT_REASONING` | `0` | Experimental: replay historical thinking blocks upstream as `{type:reasoning}` |
 | `CC_FAKE_NODE_VERSION` | `v22.21.0` | Node version reported in the envelope's `environment` field |
 | `CMD_ZDR` | `0` | Attach `x-cmd-zdr: 1` to route via ZDR only (also settable per request) |
@@ -98,9 +99,12 @@ mechanisms:
    context compaction) the session rotates automatically;
 3. **Part-level cache markers**: `cache_control` on content blocks is kept in
    place (normalized to `{type:"ephemeral"}`); markers on system / tools are
-   folded into a synthesized marker on the trailing text part of the **last
-   user message** — the breakpoint follows the conversation as it grows, so
-   the cache covers the full history except the newest turn.
+   folded into a synthesized marker on the **envelope tail** — the breakpoint
+   is placed by scanning back from the very end of the conversation (across
+   message roles, including tool rounds), so it advances as the conversation
+   grows and the cache covers the full history except the newest turn.
+   `CC_CACHE_MARKERS=replace` strips client markers and forces tail synthesis
+   (diagnostic).
 
 ### Client masquerade
 

@@ -64,6 +64,7 @@ curl http://127.0.0.1:8050/v1/messages \
 | `CC_STATE_FILE` | `data/state.json` | 设备指纹与生命周期节流状态的持久化路径 |
 | `CC_MAX_BODY_MB` | `100` | 入站请求体上限 |
 | `CC_SESSION_STRATEGY` | `prefix` | 会话策略：`prefix`（按对话稳定）/ `key`（按 key 12h+1h 轮换） |
+| `CC_CACHE_MARKERS` | `respect` | 缓存断点：`respect`（客户端标记透传，缺失时末尾合成）/ `replace`（剥掉并强制末尾合成，诊断用） |
 | `CC_ASSISTANT_REASONING` | `0` | 实验功能：将历史 thinking 块以 `{type:reasoning}` 回传上游 |
 | `CC_FAKE_NODE_VERSION` | `v22.21.0` | 信封 environment 字段中的 Node 版本 |
 | `CMD_ZDR` | `0` | 附加 `x-cmd-zdr: 1` 仅走 ZDR 路由（也可逐请求头指定） |
@@ -81,7 +82,7 @@ cmdc 的 prompt cache 按会话粒度工作。本代理三层配合：
 
 1. **显式 session 头优先**：入站 `x-session-id` / `x-claude-code-session-id` / `session_id`（≥8 字符）直接作为上游会话 ID；
 2. **前缀派生**（默认）：无显式头时从 `sha256(system + tools + 首条用户消息)` 派生稳定的 UUID 形会话 ID —— 同一对话跨轮次复用同一会话；前缀变化（工具集变更、上下文压缩）时自动换会话；
-3. **part 级缓存标记**：content 块上的 `cache_control` 原位保留（归一为 `{type:"ephemeral"}`）；system / tools 上的标记折算为**最后一条 user 消息**末尾 text part 的合成标记 —— 断点跟随对话增长，缓存覆盖除最近一轮外的全部历史。
+3. **part 级缓存标记**：content 块上的 `cache_control` 原位保留（归一为 `{type:"ephemeral"}`）；system / tools 上的标记折算为**信封尾部**最后一个 text part 的合成标记 —— 断点从信封整体末尾回扫（跨消息角色、含工具回合），随对话增长前进，缓存覆盖除最近一轮外的全部历史。`CC_CACHE_MARKERS=replace` 可剥掉客户端标记、强制末尾合成（诊断用）。
 
 ### 客户端伪装
 
