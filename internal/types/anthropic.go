@@ -24,8 +24,9 @@ type Request struct {
 }
 
 type InboundMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"` // string | []block
+	Role             string          `json:"role"`
+	Content          json.RawMessage `json:"content"` // string | []block
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
 }
 
 type Tool struct {
@@ -47,18 +48,20 @@ type CacheControl struct {
 
 // Block 入站 content 块的并集（text/image/thinking/tool_use/tool_result/...）。
 type Block struct {
-	Type         string          `json:"type"`
-	Text         string          `json:"text,omitempty"`
-	Thinking     string          `json:"thinking,omitempty"`
-	Signature    string          `json:"signature,omitempty"` // 仅入站历史携带，不回传上游
-	Source       *ImageSource    `json:"source,omitempty"`
-	ID           string          `json:"id,omitempty"`
-	Name         string          `json:"name,omitempty"`
-	Input        json.RawMessage `json:"input,omitempty"`
-	ToolUseID    string          `json:"tool_use_id,omitempty"`
-	Content      json.RawMessage `json:"content,omitempty"` // tool_result: string | []block（递归）
-	IsError      bool            `json:"is_error,omitempty"`
-	CacheControl *CacheControl   `json:"cache_control,omitempty"`
+	Type             string          `json:"type"`
+	Text             string          `json:"text,omitempty"`
+	Thinking         string          `json:"thinking,omitempty"`
+	Reasoning        string          `json:"reasoning,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	Signature        string          `json:"signature,omitempty"` // 仅入站历史携带，不回传上游
+	Source           *ImageSource    `json:"source,omitempty"`
+	ID               string          `json:"id,omitempty"`
+	Name             string          `json:"name,omitempty"`
+	Input            json.RawMessage `json:"input,omitempty"`
+	ToolUseID        string          `json:"tool_use_id,omitempty"`
+	Content          json.RawMessage `json:"content,omitempty"` // tool_result: string | []block（递归）
+	IsError          bool            `json:"is_error,omitempty"`
+	CacheControl     *CacheControl   `json:"cache_control,omitempty"`
 }
 
 type ImageSource struct {

@@ -21,9 +21,10 @@ func parseReq(t *testing.T, raw string) *types.Request {
 
 func testOpts() BuildOpts {
 	return BuildOpts{
-		Now:         time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC),
-		NodeVersion: "v22.21.0",
-		WorkingDir:  `C:\Users\dev\projects\app-a3f2`,
+		Now:                time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC),
+		NodeVersion:        "v22.21.0",
+		WorkingDir:         `C:\Users\dev\projects\app-a3f2`,
+		AssistantReasoning: true,
 	}
 }
 
@@ -265,31 +266,58 @@ func TestBuildCcRequest_MaxTokensClamp(t *testing.T) {
 	}
 }
 
-func TestBuildCcRequest_AssistantThinkingDefaultDroppedOptInKept(t *testing.T) {
+func TestBuildCcRequest_AssistantThinkingDefaultKeptAndOrdered(t *testing.T) {
 	raw := `{"max_tokens": 10, "messages": [
 		{"role": "assistant", "content": [
-			{"type": "thinking", "thinking": "hmm", "signature": "sig"},
-			{"type": "text", "text": "answer"}
+			{"type": "text", "text": "answer"},
+			{"type": "tool_use", "id": "call_1", "name": "testTool", "input": {}},
+			{"type": "thinking", "thinking": "hmm", "signature": "sig"}
 		]},
 		{"role": "user", "content": "next"}
 	]}`
+	// 默认 AssistantReasoning: true
 	cc, _ := BuildCcRequest(parseReq(t, raw), testOpts())
-	for _, p := range cc.Params.Messages[0].Content {
-		if p.Type == "reasoning" {
-			t.Error("thinking should be dropped by default")
-		}
+	content := cc.Params.Messages[0].Content
+	if len(content) != 3 {
+		t.Fatalf("expected 3 parts, got %d", len(content))
 	}
+	// 严格遵循 [reasoning, text, tool-call] 次序
+	if content[0].Type != "reasoning" || content[0].Text != "hmm" {
+		t.Errorf("part 0: want reasoning 'hmm', got %+v", content[0])
+	}
+	if content[1].Type != "text" || content[1].Text != "answer" {
+		t.Errorf("part 1: want text 'answer', got %+v", content[1])
+	}
+	if content[2].Type != "tool-call" || content[2].ToolCallID != "call_1" {
+		t.Errorf("part 2: want tool-call 'call_1', got %+v", content[2])
+	}
+
+	// 显式关闭 AssistantReasoning: false 时丢弃思考块
 	opts := testOpts()
-	opts.AssistantReasoning = true
+	opts.AssistantReasoning = false
 	cc2, _ := BuildCcRequest(parseReq(t, raw), opts)
-	found := false
 	for _, p := range cc2.Params.Messages[0].Content {
-		if p.Type == "reasoning" && p.Text == "hmm" {
-			found = true
+		if p.Type == "reasoning" {
+			t.Error("thinking should be dropped when AssistantReasoning is false")
 		}
 	}
-	if !found {
-		t.Error("AssistantReasoning=1 should keep thinking as {type:reasoning}")
+}
+
+func TestBuildCcRequest_AssistantReasoningContentMessageLevel(t *testing.T) {
+	raw := `{"max_tokens": 10, "messages": [
+		{"role": "assistant", "content": "hello world", "reasoning_content": "deep thinking"},
+		{"role": "user", "content": "next"}
+	]}`
+	cc, _ := BuildCcRequest(parseReq(t, raw), testOpts())
+	content := cc.Params.Messages[0].Content
+	if len(content) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(content))
+	}
+	if content[0].Type != "reasoning" || content[0].Text != "deep thinking" {
+		t.Errorf("part 0: want reasoning 'deep thinking', got %+v", content[0])
+	}
+	if content[1].Type != "text" || content[1].Text != "hello world" {
+		t.Errorf("part 1: want text 'hello world', got %+v", content[1])
 	}
 }
 

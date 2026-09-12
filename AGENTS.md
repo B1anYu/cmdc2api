@@ -39,7 +39,10 @@
    - 优先级 1：显式 Session Header（`x-session-id` / `x-claude-code-session-id` / `session_id` ≥ 8 字符）；
    - 优先级 2：前缀哈希派生（`CC_SESSION_STRATEGY=prefix`，默认）：`sha256(system + tools + 首条用户消息)`，同对话跨轮稳定；
    - 优先级 3：Per-Key 轮换（`CC_SESSION_STRATEGY=key`，原版 12h + 1h 抖动轮换）。
-4. **Thinking 思考签名**：采用确定性伪造（`0x12` + sha256 前缀）满足下游客户端浅校验；上游不回传签名，历史记录中的签名发往上游时需过滤。
+4. **Thinking 思考回传与签名**：
+   - 上游 CC 在思考模式下强制校验历史中的思考过程，缺失会导致 `502 (The reasoning_content in the thinking mode must be passed back to the API)`；
+   - 历史 assistant 思考块默认以 `{type: "reasoning", text: ...}` 格式回传上游（可通过 `CC_ASSISTANT_REASONING=0` 显式禁用），且严格遵循 CC CLI 抓包顺序 `[reasoning, text, tool-call]`；
+   - Thinking 思考签名采用确定性伪造（`0x12` + sha256 前缀）满足下游客户端浅校验；上游不接受也不回传签名，历史记录中的签名发往上游时需过滤。
 5. **安全丢弃字段**（上游无对应能力，对齐原版行为）：
    - `stop_sequences`、`top_k`、`metadata.user_id`、`tool_result.is_error`。
 6. **客户端伪装自洽性**：

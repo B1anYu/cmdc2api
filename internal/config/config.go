@@ -28,8 +28,9 @@ type Config struct {
 	//   respect（默认）— 客户端 part 级标记透传，缺失时末尾合成兜底
 	//   replace         — 剥掉客户端标记，强制末尾合成（A/B 诊断用）
 	CacheMarkers string
-	// AssistantReasoning 实验开关：把入站 assistant thinking 块以
-	// {type:"reasoning"} 回传上游（默认关闭，安全丢弃历史思考块）。
+	// AssistantReasoning 思考内容回传策略：
+	// 把入站 assistant thinking/reasoning 块以 {type:"reasoning"} 回传上游。
+	// 默认开启（true），对齐 CC CLI 抓包规范并避免思考模式下多轮交互触发上游 502。
 	AssistantReasoning bool
 	// FakeNodeVersion 信封 config.environment 里伪装的 Node 版本。
 	FakeNodeVersion string
@@ -48,7 +49,7 @@ func Load() Config {
 		IdleBuffer:        90 * time.Second,
 		SessionStrategy:   "prefix",
 		CacheMarkers:      "respect",
-		AssistantReasoning: false,
+		AssistantReasoning: true,
 		FakeNodeVersion:   "v22.21.0",
 	}
 	if v := os.Getenv("PORT"); v != "" {
@@ -84,8 +85,8 @@ func Load() Config {
 	if v := os.Getenv("CC_CACHE_MARKERS"); v == "respect" || v == "replace" {
 		c.CacheMarkers = v
 	}
-	if v := os.Getenv("CC_ASSISTANT_REASONING"); v == "1" {
-		c.AssistantReasoning = true
+	if v := os.Getenv("CC_ASSISTANT_REASONING"); v != "" {
+		c.AssistantReasoning = (v == "1" || v == "true")
 	}
 	if v := os.Getenv("CC_FAKE_NODE_VERSION"); v != "" {
 		c.FakeNodeVersion = v

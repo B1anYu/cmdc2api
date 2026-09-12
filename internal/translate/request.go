@@ -21,7 +21,7 @@ type BuildOpts struct {
 	Now                time.Time
 	NodeVersion        string // 伪装的 Node.js 版本（如 "v22.21.0"）
 	WorkingDir         string // win32 风格伪装路径，由会话派生
-	AssistantReasoning bool   // 实验开关：将 assistant thinking 块回传上游
+	AssistantReasoning bool   // 将 assistant thinking 块回传上游（对齐 CC CLI 并避免多轮思考 502）
 	// CacheMarkers 缓存断点策略：
 	// "" / "respect"（默认：透传客户端 part 级标记，缺失时在末尾合成）；
 	// "replace"（剥除客户端标记，强制在末尾合成，用于诊断）。
@@ -46,7 +46,11 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 			warns = append(warns, fmt.Sprintf("message %d (role %s): content not string/block-array, dropped: %v", i, m.Role, err))
 			continue
 		}
-		parsed = append(parsed, parsedMessage{role: m.Role, blocks: blocks})
+		parsed = append(parsed, parsedMessage{
+			role:             m.Role,
+			blocks:           blocks,
+			reasoningContent: m.ReasoningContent,
+		})
 		if m.Role == "assistant" {
 			for _, b := range blocks {
 				if b.Type == "tool_use" && b.ID != "" {
@@ -190,8 +194,9 @@ func PrefixCacheKey(req *types.Request) string {
 // ---------- 消息解析 ----------
 
 type parsedMessage struct {
-	role   string
-	blocks []types.Block
+	role             string
+	blocks           []types.Block
+	reasoningContent string
 }
 
 // parseBlocks 解析 content 字段（string | []block；null 视为空）。
@@ -313,30 +318,56 @@ func convertUser(pm *parsedMessage, toolNames map[string]string, warns *[]string
 }
 
 func convertAssistant(pm *parsedMessage, opts BuildOpts, warns *[]string) []types.CcMessage {
-	var parts []types.CcPart
+	var reasoningParts []types.CcPart
+	var textParts []types.CcPart
+	var toolParts []types.CcPart
 	thinkingDropped := false
+
+	// 若消息级携带 reasoning_content，先放入 reasoning
+	if pm.reasoningContent != "" {
+		if opts.AssistantReasoning {
+			reasoningParts = append(reasoningParts, types.CcPart{Type: "reasoning", Text: pm.reasoningContent})
+		} else {
+			thinkingDropped = true
+		}
+	}
+
 	for _, b := range pm.blocks {
 		switch b.Type {
-		case "text":
-			if b.Text == "" {
+		case "thinking", "reasoning":
+			txt := b.Thinking
+			if txt == "" {
+				txt = b.Reasoning
+			}
+			if txt == "" {
+				txt = b.ReasoningContent
+			}
+			if txt == "" {
+				txt = b.Text
+			}
+			if txt == "" {
 				continue
 			}
-			parts = append(parts, types.CcPart{Type: "text", Text: b.Text, CacheControl: ccCC(b.CacheControl)})
-		case "thinking":
 			if opts.AssistantReasoning {
-				// 实验特性：将思考块以 {type: "reasoning"} 格式转发上游
-				parts = append(parts, types.CcPart{Type: "reasoning", Text: b.Thinking})
+				if pm.reasoningContent != txt {
+					reasoningParts = append(reasoningParts, types.CcPart{Type: "reasoning", Text: txt})
+				}
 			} else {
 				thinkingDropped = true
 			}
 		case "redacted_thinking":
 			// 无明文可还原，跳过
+		case "text":
+			if b.Text == "" {
+				continue
+			}
+			textParts = append(textParts, types.CcPart{Type: "text", Text: b.Text, CacheControl: ccCC(b.CacheControl)})
 		case "tool_use":
 			input := b.Input
 			if len(input) == 0 || string(input) == "null" {
 				input = json.RawMessage("{}")
 			}
-			parts = append(parts, types.CcPart{
+			toolParts = append(toolParts, types.CcPart{
 				Type:         "tool-call",
 				ToolCallID:   b.ID, // 恒等透传，续轮配对依赖原始 ID
 				ToolName:     b.Name,
@@ -350,8 +381,15 @@ func convertAssistant(pm *parsedMessage, opts BuildOpts, warns *[]string) []type
 		}
 	}
 	if thinkingDropped {
-		*warns = append(*warns, "assistant thinking block(s) dropped (set CC_ASSISTANT_REASONING=1 to experiment with {type:reasoning} passthrough)")
+		*warns = append(*warns, "assistant thinking block(s) dropped (CC_ASSISTANT_REASONING=0)")
 	}
+
+	// 按照 CC CLI 抓包规范严格排序：[reasoning, text, tool-call]
+	parts := make([]types.CcPart, 0, len(reasoningParts)+len(textParts)+len(toolParts))
+	parts = append(parts, reasoningParts...)
+	parts = append(parts, textParts...)
+	parts = append(parts, toolParts...)
+
 	if len(parts) == 0 {
 		return nil
 	}
