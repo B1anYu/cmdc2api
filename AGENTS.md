@@ -48,24 +48,26 @@
 6. **客户端伪装自洽性**：
    - 指纹/Lifecycle/信封 Environment/WorkingDir 全套对齐 Windows x64。
    - 出站 Transport 强制 `HTTP/1.1` 且置空 `User-Agent`（Go 中 `h.Set("User-Agent", "")` 可抑制默认 UA）。
-7. **Token Usage 换算**：`input_tokens = max(0, inputTokens − cachedInputTokens)`，严禁改回无脑透传（详见下节）。
+7. **Token Usage 换算**：优先采用上游 `inputTokenDetails.noCacheTokens` 原生非缓存输入；缺失时回退到 `max(0, inputTokens − cachedInputTokens)`，严禁改回无脑透传（详见下节）。
 
 ---
 
-## 四、 Usage 计费口径（2026-09-09 定案）
+## 四、 Usage 计费口径（2026-09-09 定案与 2026-09-12 升级）
 
 ### 1. 现象与实测
 - 上游 API 返回的 `cachedInputTokens / inputTokens` 比例恒定 $\approx 50\%$。
 - 相同请求在上游控制台记录的「总输入」正好为 API `inputTokens` 的一半（例如 80K vs 40K）。
 
-### 2. 模型机理
+### 2. 模型机理与新字段
 - cmdc 内部多步循环按步累加 usage（Step 1 全量处理产生 P、Step 2 全量命中缓存产生 P 缓存读取）→ I ≈ 2P, C ≈ P。
+- 上游近期已在 `inputTokenDetails.noCacheTokens` 原生回报去重后的非缓存输入 tokens（满足 `noCacheTokens + cacheReadTokens === inputTokens`）。
 - 上游后台按去重 Prompt 计费。
 
 ### 3. 定案公式
 ```text
-input_tokens = max(0, inputTokens - cachedInputTokens)
+input_tokens = (inputTokenDetails.noCacheTokens != nil) ? noCacheTokens : max(0, inputTokens - cachedInputTokens)
 ```
+- 优先读取上游原生 `noCacheTokens`；若缺失则执行减法兜底。
 - 在「多步求和」与「总量含缓存」两种模型下均等于真实消耗，且与上游后台总输入一致。
 - 抽验指标：网关 `input_tokens` 必须与 cmdc 后台总输入统计对齐。
 

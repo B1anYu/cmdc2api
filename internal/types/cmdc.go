@@ -99,15 +99,19 @@ type CcEventError struct {
 }
 
 // CcUsage 上游 usage 形状（proxy.mjs normalizeUsage 观察）。
-// 实弹定案：inputTokens 把缓存读取重复计入（真实总输入 = inputTokens −
-// cachedInputTokens），出站前由 translate 换算为 Anthropic 口径。
+// 实弹定案：CC 实际已在 inputTokenDetails.noCacheTokens 给出非缓存部分；
+// 缺失时回退到 inputTokens − cachedInputTokens 减法。
 type CcUsage struct {
-	InputTokens       int `json:"inputTokens"`
-	OutputTokens      int `json:"outputTokens"`
-	CachedInputTokens int `json:"cachedInputTokens"`
-	InputTokenDetails *struct {
-		CacheWriteTokens int `json:"cacheWriteTokens"`
-	} `json:"inputTokenDetails,omitempty"`
+	InputTokens       int                  `json:"inputTokens"`
+	OutputTokens      int                  `json:"outputTokens"`
+	CachedInputTokens int                  `json:"cachedInputTokens"`
+	InputTokenDetails *CcInputTokenDetails `json:"inputTokenDetails,omitempty"`
+}
+
+type CcInputTokenDetails struct {
+	NoCacheTokens    *int `json:"noCacheTokens,omitempty"`
+	CacheReadTokens  int  `json:"cacheReadTokens,omitempty"`
+	CacheWriteTokens int  `json:"cacheWriteTokens,omitempty"`
 }
 
 // Normalize 反虚假计费：outputTokens 为 0 时把 input/cached 一并清零
@@ -116,5 +120,11 @@ func (u *CcUsage) Normalize() {
 	if u != nil && u.OutputTokens == 0 {
 		u.InputTokens = 0
 		u.CachedInputTokens = 0
+		if u.InputTokenDetails != nil {
+			zero := 0
+			u.InputTokenDetails.NoCacheTokens = &zero
+			u.InputTokenDetails.CacheReadTokens = 0
+			u.InputTokenDetails.CacheWriteTokens = 0
+		}
 	}
 }

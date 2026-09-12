@@ -182,21 +182,34 @@ func (t *StreamTranslator) DeltaUsage() types.DeltaUsage {
 	u := t.usage
 	u.Normalize()
 	cacheWrite := 0
+	var noCache *int
 	if u.InputTokenDetails != nil {
 		cacheWrite = u.InputTokenDetails.CacheWriteTokens
+		noCache = u.InputTokenDetails.NoCacheTokens
 	}
 	var ccPtr *int
 	if cacheWrite > 0 {
 		ccPtr = &cacheWrite
 	}
-	// cmdc 上游返回的 inputTokens 包含内部多步处理累加的缓存读取（数值约为后台控制台统计的两倍）。
-	// 换算公式 input_tokens = max(0, inputTokens − cachedInputTokens) 精准对齐 cmdc 控制台去重后的实际 Prompt 输入，
-	// 并在多步累加与总量包含缓存两种模型下均保持一致。
-	input := u.InputTokens - u.CachedInputTokens
-	if input < 0 {
-		input = 0
-	}
+
 	cached := u.CachedInputTokens
+	if u.InputTokenDetails != nil && u.InputTokenDetails.CacheReadTokens > 0 && cached == 0 {
+		cached = u.InputTokenDetails.CacheReadTokens
+	}
+
+	// 换算 Anthropic 的 input_tokens（非缓存部分）：
+	// 上游 CC 实际已在 inputTokenDetails.noCacheTokens 预先算好非缓存输入 tokens，优先直接采用；
+	// 缺失时采用减法公式回退：max(0, inputTokens − cachedInputTokens)。
+	var input int
+	if noCache != nil && *noCache >= 0 {
+		input = *noCache
+	} else {
+		input = u.InputTokens - cached
+		if input < 0 {
+			input = 0
+		}
+	}
+
 	if !t.hasUsage {
 		input, cached = 0, 0
 	}

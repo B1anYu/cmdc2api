@@ -256,6 +256,44 @@ func TestFakeThinkingSignature(t *testing.T) {
 	}
 }
 
+func TestStream_NoCacheTokensPriority(t *testing.T) {
+	tr := NewStreamTranslator("test-model", "msg_test_nocache")
+	evs := feedAll(t, tr,
+		`{"type":"text-delta","text":"hello"}`,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":100,"outputTokens":42,"cachedInputTokens":10,"inputTokenDetails":{"noCacheTokens":85,"cacheWriteTokens":5}}}`,
+	)
+	var md types.MessageDeltaEvent
+	found := false
+	for _, e := range evs {
+		if e.Name == "message_delta" {
+			dataJSON(t, e, &md)
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("message_delta event not found")
+	}
+	if md.Usage.InputTokens != 85 {
+		t.Errorf("input_tokens = %d, want 85 (noCacheTokens priority)", md.Usage.InputTokens)
+	}
+	if md.Usage.CacheReadInputTokens != 10 {
+		t.Errorf("cache_read = %d, want 10", md.Usage.CacheReadInputTokens)
+	}
+	if md.Usage.CacheCreationInputTokens == nil || *md.Usage.CacheCreationInputTokens != 5 {
+		t.Errorf("cache_creation = %v, want 5", md.Usage.CacheCreationInputTokens)
+	}
+
+	agg := NewAggregator()
+	for _, e := range evs {
+		agg.Feed(e)
+	}
+	msg := agg.Message()
+	if msg.Usage.InputTokens != 85 {
+		t.Errorf("aggregated input_tokens = %d, want 85", msg.Usage.InputTokens)
+	}
+}
+
 func mustJSON(t *testing.T, v any) string {
 	t.Helper()
 	b, err := json.Marshal(v)
