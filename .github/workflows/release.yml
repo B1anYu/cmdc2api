@@ -1,0 +1,125 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+            archive: tar.gz
+          - os: linux
+            arch: arm64
+            ext: ""
+            archive: tar.gz
+          - os: darwin
+            arch: amd64
+            ext: ""
+            archive: tar.gz
+          - os: darwin
+            arch: arm64
+            ext: ""
+            archive: tar.gz
+          - os: windows
+            arch: amd64
+            ext: .exe
+            archive: zip
+          - os: windows
+            arch: arm64
+            ext: .exe
+            archive: zip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Determine Version
+        id: ver
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [[ "$TAG" == refs/heads/* ]] || [[ -z "$TAG" ]]; then
+            TAG="$(git describe --tags --always 2>/dev/null || echo 'dev')"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          BIN_NAME="cmdc2api${{ matrix.ext }}"
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X 'main.version=${{ steps.ver.outputs.tag }}'" -o "dist/$BIN_NAME" .
+
+      - name: Package archive
+        id: pkg
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          ARCHIVE_NAME="cmdc2api-${TAG}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p package-staging
+          cp "dist/cmdc2api${{ matrix.ext }}" package-staging/
+          cp LICENSE README_zh.md README.md package-staging/
+          
+          mkdir -p artifacts
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd package-staging && zip -r "../artifacts/${ARCHIVE_NAME}.zip" .)
+          else
+            tar -czvf "artifacts/${ARCHIVE_NAME}.tar.gz" -C package-staging .
+          fi
+
+      - name: Upload artifact for release
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}-${{ matrix.arch }}
+          path: artifacts/*
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Generate SHA256 Checksums
+        working-directory: release-assets
+        run: |
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

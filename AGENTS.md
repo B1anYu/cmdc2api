@@ -93,6 +93,10 @@ input_tokens = (inputTokenDetails.noCacheTokens != nil) ? noCacheTokens : max(0,
 - **发版流**：
   - 发版步骤：`git tag vX.Y.Z && git push origin vX.Y.Z`（**Tag 必须单独 push**，避免被 paths-ignore 吞掉）$\rightarrow$ 触发 GitHub Release 并发布 `:latest` 与 `:X.Y.Z` 镜像。
   - **`:latest` 仅随 Tag 更新，不跟 `main`**。VPS 若部署 `:latest`，合入关键修复后务必打 Tag。
+> [!IMPORTANT]
+> **镜像更新与交叉编译发版强绑定 Tag**：
+> - `:latest` Docker 镜像与多平台交叉编译二进制（GitHub Releases）**仅在推送 Tag 时触发构建**；普通 push 到 `main` 仅触发 `:dev` 镜像构建。
+> - 若需让 `:latest` 镜像更新或发布多平台二进制，务必执行发版推送：`git tag vX.Y.Z && git push origin vX.Y.Z`。
 - **状态迁移**：换机迁移时务必带上 `data/state.json`，确保设备指纹连续稳定。
 
 ---
@@ -112,6 +116,7 @@ input_tokens = (inputTokenDetails.noCacheTokens != nil) ? noCacheTokens : max(0,
 
 ## 八、 智能体协作指引
 
-- **任务原则**：简单、单点查询由主 Agent 直接执行；子智能体仅用于大规模并行探索或深层调研。
-- **模型偏好**：若使用子智能体，非复杂任务优先使用轻量（flash）模型以节省资源。
+- **主动发版 Tag 提醒规范**：
+  - **触发时机**：当协助完成功能新增、Bug 修复或准备交付部署时。
+  - **行动要求**：智能体须主动提示用户提交 Tag，明确说明 `:latest` 镜像与多平台交叉编译二进制均依赖 Tag 触发构建，并附带具体命令：`git tag vX.Y.Z && git push origin vX.Y.Z`。
 

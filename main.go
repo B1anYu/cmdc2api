@@ -17,6 +17,8 @@ import (
 	"github.com/B1anYu/cmdc2api/internal/server"
 )
 
+var version = "dev"
+
 func main() {
 	cfg := config.Load()
 
@@ -42,6 +44,7 @@ func main() {
 
 	go func() {
 		slog.Info("cmdc2api started",
+			"version", version,
 			"addr", httpSrv.Addr,
 			"apiBase", cfg.APIBase,
 			"sessionStrategy", cfg.SessionStrategy,
