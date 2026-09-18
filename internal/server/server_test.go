@@ -467,3 +467,48 @@ func TestEndToEnd_Health(t *testing.T) {
 		t.Errorf("health = %d %q", resp.StatusCode, b)
 	}
 }
+
+// 兜底 404（未注册路径）与 panic 恢复这类「handler 之外的出口」也必须按端点协议出形状：
+// OpenAI 端点出 OpenAI 形状，其余保持 Anthropic 形状，否则客户端 SDK 解析失败。
+// 形状判定依据：Anthropic 体有顶层 "type":"error"，OpenAI 体只有 "error" 对象。
+func TestEndToEnd_NotFoundShapeByPath(t *testing.T) {
+	cases := []struct {
+		path   string
+		openAI bool
+	}{
+		{"/v1/messages/nope", false},
+		{"/v1/models/nope", false},
+		{"/nope", false},
+		{"/v1/chat/completions/nope", true},
+		{"/v1/responses/nope", true},
+	}
+	f := newFakeCC(t)
+	proxy := newProxy(t, f, nil)
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			resp, err := http.Post(proxy.URL+tc.path, "application/json", strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			_, hasTopLevelType := body["type"]
+			if hasTopLevelType == tc.openAI {
+				t.Fatalf("body = %v, want openAI=%v", body, tc.openAI)
+			}
+			errObj, ok := body["error"].(map[string]any)
+			if !ok || errObj["type"] != "not_found_error" {
+				t.Errorf("error = %v, want {type: not_found_error}", body["error"])
+			}
+			if !tc.openAI && errObj["message"] != "Not found" {
+				t.Errorf("message = %v", errObj["message"])
+			}
+		})
+	}
+}

@@ -5,6 +5,7 @@ package server
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,11 +39,13 @@ func (s *Server) CleanupSessions() { s.sessions.Cleanup() }
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/messages", s.handleMessages)
+	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("POST /v1/responses", s.handleResponses)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /{$}", handleHealth)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		anthropicError(w, http.StatusNotFound, "not_found_error", "Not found", 0)
+		writePathError(w, r, http.StatusNotFound, "not_found_error", "Not found")
 	})
 	return s.middleware(mux)
 }
@@ -69,7 +72,7 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			if rec := recover(); rec != nil {
 				slog.Error("panic recovered", "path", r.URL.Path, "panic", rec)
 				if !sw.wrote {
-					anthropicError(sw, http.StatusInternalServerError, "api_error", "internal server error", 0)
+					writePathError(sw, r, http.StatusInternalServerError, "api_error", "internal server error")
 				}
 			}
 			slog.Info("request",
@@ -123,6 +126,24 @@ func (s *Server) resetTimeouts() {
 	s.consec = 0
 }
 
+// writePathError 按请求路径选择错误出口形状，供中间件与兜底 404 这类拿不到 handler 上下文
+// （或端点根本不存在）的出口使用：OpenAI 端点出 OpenAI 形状，其余（含 /v1/models）保持
+// Anthropic 形状。「端点用什么协议，错误就用什么形状」在管线之外也必须成立，
+// 否则客户端 SDK 会在这些路径上解析失败。
+func writePathError(w http.ResponseWriter, r *http.Request, status int, errType, message string) {
+	if isOpenAIErrorPath(r.URL.Path) {
+		openaiErrors{}.Write(w, status, errType, message, 0)
+		return
+	}
+	anthropicError(w, status, errType, message, 0)
+}
+
+// isOpenAIErrorPath 判断路径是否属于 OpenAI 形状端点。
+// 前缀匹配而非等值匹配：带上尾部子路径（如 /v1/chat/completions/xxx）仍按该协议出口。
+func isOpenAIErrorPath(path string) bool {
+	return strings.HasPrefix(path, "/v1/responses") || strings.HasPrefix(path, "/v1/chat/completions")
+}
+
 // anthropicError 统一错误出口：Anthropic 形状 + Retry-After 头。
 func anthropicError(w http.ResponseWriter, status int, errType, message string, retryAfter int) {
 	body := map[string]any{
@@ -140,8 +161,8 @@ func anthropicError(w http.ResponseWriter, status int, errType, message string, 
 	_ = writeJSON(w, body)
 }
 
-// mapHTTPError 上游 HTTP 错误响应 → Anthropic 错误。
-func mapHTTPError(w http.ResponseWriter, ccStatus int, body []byte) {
+// mapHTTPError 上游 HTTP 错误响应 → 出站协议错误（形状由 ew 决定）。
+func mapHTTPError(w http.ResponseWriter, ew ErrorWriter, ccStatus int, body []byte) {
 	status, typ, msg, retry := errs.Map(ccStatus, body)
-	anthropicError(w, status, typ, msg, retry)
+	ew.Write(w, status, typ, msg, retry)
 }

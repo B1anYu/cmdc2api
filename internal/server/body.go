@@ -10,8 +10,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/B1anYu/cmdc2api/internal/types"
 )
 
 // ---------- 请求体读取（413 排空模式） ----------
@@ -36,23 +34,25 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// readBody 读取并校验请求体。超限/坏 JSON 时已写好错误响应，返回 false。
-func (s *Server) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+// readBody 读取并校验请求体。超限/坏 JSON 时已按出站协议写好错误响应，返回 false。
+// ew 决定错误体形状：入站协议决定错误形状，读体阶段同样不能硬编码 Anthropic 形状，
+// 否则 OpenAI 端点会在开流前吐出下游 SDK 解析不了的错误体。
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request, ew ErrorWriter) ([]byte, bool) {
 	lr := &limitedReader{r: r.Body, remaining: s.cfg.MaxBodyBytes}
 	data, err := io.ReadAll(lr)
 	if errors.Is(err, errBodyTooLarge) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, drainLimit))
 		mb := s.cfg.MaxBodyBytes / (1 << 20)
-		anthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+		ew.Write(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
 			fmt.Sprintf("Request body exceeds %dMB limit", mb), 0)
 		return nil, false
 	}
 	if err != nil {
-		anthropicError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON body", 0)
+		ew.Write(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON body", 0)
 		return nil, false
 	}
 	if !json.Valid(data) {
-		anthropicError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON body", 0)
+		ew.Write(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON body", 0)
 		return nil, false
 	}
 	return data, true
@@ -132,18 +132,24 @@ func (ir *idleReader) Close() error {
 
 // sseWriter 延迟发送 200 状态码与 SSE 响应头：在未确认产出实质内容（text/thinking/tool_use）前先缓冲事件。
 // 若首帧前发生超时或错误，可直接回退为标准 HTTP JSON 错误响应，便于客户端 SDK 进行退避重试。
+//
+// 缓冲的是已编码的字节帧而非类型化事件：Anthropic / Responses / Chat 三种出站协议的帧形状不同，
+// 在写出这一层只认字节，协议差异由 EventEncoder 吸收。
 type sseWriter struct {
 	w       http.ResponseWriter
 	started bool
-	pending []types.StreamEvent
+	pending [][]byte
 }
 
-func (s *sseWriter) add(evs ...types.StreamEvent) {
-	if s.started {
-		s.write(evs)
+func (s *sseWriter) add(frames ...[]byte) {
+	if len(frames) == 0 {
 		return
 	}
-	s.pending = append(s.pending, evs...)
+	if s.started {
+		s.write(frames)
+		return
+	}
+	s.pending = append(s.pending, frames...)
 }
 
 // start 写 200 头并刷出缓冲。若从未有内容（错误/零输出），调用方
@@ -161,9 +167,9 @@ func (s *sseWriter) start() {
 	s.pending = nil
 }
 
-func (s *sseWriter) write(evs []types.StreamEvent) {
-	for _, e := range evs {
-		if _, err := s.w.Write(e.Encode()); err != nil {
+func (s *sseWriter) write(frames [][]byte) {
+	for _, f := range frames {
+		if _, err := s.w.Write(f); err != nil {
 			return
 		}
 	}

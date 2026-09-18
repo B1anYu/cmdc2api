@@ -2,8 +2,8 @@
 
 ## 一、 项目定位与参照
 
-- **项目目标**：Anthropic Messages → cmdc 单跳直转反向代理（Go 编写，零第三方依赖，静态二进制部署）。
-- **当前版本**：`v0.1.2`（2026-09-09）。
+- **项目目标**：多协议入站反向代理——Anthropic Messages（一等公民）、OpenAI Responses（面向 Codex CLI）与 OpenAI Chat Completions 三端点 → cmdc 单跳直转（Go 编写，零第三方依赖，静态二进制部署）。
+- **当前版本**：`v0.1.4`（2026-09-17）。
 - **权威参照**：
   - 协议事实与伪装标准：`reference/commandcode-proxy/proxy.mjs`（MIT，基于 commit `fcdb56a`）。
   - 协议转换技法参考：`reference/sub2api/backend/internal/pkg/apicompat`（LGPL-3.0，仅借鉴架构手法，未复制代码）。
@@ -34,21 +34,32 @@
    - 客户端鉴权头兼容 `Authorization: Bearer user_xxx` 与 `x-api-key: user_xxx`。
    - 鉴权 key（cmdc 格式通常为 `user_xxx`）原样透传给上游，代理本身不校验 key 的合法性。
    - 明文 API Key 严禁写入日志或持久化磁盘（`data/state.json` 中仅以 `sha256(key)` 前缀为索引）。
-2. **单跳直转**：Anthropic 协议 → cmdc 信封一步完成，**坚决不引入 OpenAI Chat 中间层**，避免字段与类型丢失。
-3. **会话亲和优先级**：
+2. **单跳直转与星形拓扑**：客户端协议 → 规范格式（`types.Request`，Anthropic Messages 形状）→ cmdc 信封一步完成，**坚决不引入任何中间层**（含 OpenAI Chat），避免字段与类型丢失。Anthropic Messages 是一等公民与内部规范格式：`/v1/responses`（面向 Codex CLI）与 `/v1/chat/completions` 的入站归一化（`translate/respin.go` / `chatin.go`）插在 `BuildCcRequest` **之前**，会话亲和、缓存断点合成、伪装全部免费继承；出站协议差异全部收敛在 `types.StreamEvent` **之后**（`translate/respout.go` / `chatout.go`，与 `Aggregator` 同层；server 侧经 `pipeline.go` 的 `EventEncoder`/`EventAggregator`/`ErrorWriter` 三接口注入），`StreamTranslator` 与 `masq` 包对入站协议零感知。
+3. **Responses/Chat 出站硬约束**（2026-09-17 定案，违反会破坏严格客户端尤其是 Codex）：
+   - Responses SSE 帧逐事件手工构造（反 omitempty）：`output_index/content_index/summary_index` 的 0 必须出现；`function_call.arguments` 可为空串但键必须在；`message.content` 恒数组；reasoning item **绝不带 id**（OpenAI 404 未签发 id）且剔除 null 的 `status/content` 字段（C# SDK 崩溃）。
+   - Responses 流**没有** `data: [DONE]`；Chat 流**必须**以 `data: [DONE]` 收尾。
+   - `sequence_number` 从 0 单调递增；终态事件（`response.completed/incomplete/failed`）必须携带完整 output 数组与 usage。
+   - 流式与非流式消费**同一状态机**产出（严禁双实现，防语义分裂）；流内 error 事件在编码器内转 `response.failed`；`Finish()` 必须幂等（管线无条件调用）。
+   - 工具调用全量参数按 ~10 rune 分片模拟增量（上游一次性给全 input）。
+   - Codex 工具族（custom/grammar、tool_search、namespace、additional_tools）入站降级为普通 function 工具，`ResponsesToolMapping` 由 respin 产出、respout 按其回程还原 item 形态（`fc_/ctc_/tsc_` id 前缀）；`previous_response_id` 一律 400 拒绝（Codex `store:false` 全量回放，不依赖服务端状态）。
+   - tool_use/tool_result 配对修复（`translate/pairing.go` 的 merge→pair→merge）是双入站共享的正确性核心，三条不变式：结果紧邻前条调用、调用被下条结果应答、角色严格交替。
+4. **会话亲和优先级**：
    - 优先级 1：显式 Session Header（`x-session-id` / `x-claude-code-session-id` / `session_id` ≥ 8 字符）；
    - 优先级 2：前缀哈希派生（`CC_SESSION_STRATEGY=prefix`，默认）：`sha256(system + tools + 首条用户消息)`，同对话跨轮稳定；
    - 优先级 3：Per-Key 轮换（`CC_SESSION_STRATEGY=key`，原版 12h + 1h 抖动轮换）。
-4. **Thinking 思考回传与签名**：
+5. **Thinking 思考回传与签名**：
    - 上游 CC 在思考模式下强制校验历史中的思考过程，缺失会导致 `502 (The reasoning_content in the thinking mode must be passed back to the API)`；
    - 历史 assistant 思考块默认以 `{type: "reasoning", text: ...}` 格式回传上游（可通过 `CC_ASSISTANT_REASONING=0` 显式禁用），且严格遵循 CC CLI 抓包顺序 `[reasoning, text, tool-call]`；
    - Thinking 思考签名采用确定性伪造（`0x12` + sha256 前缀）满足下游客户端浅校验；上游不接受也不回传签名，历史记录中的签名发往上游时需过滤。
-5. **安全丢弃字段**（上游无对应能力，对齐原版行为）：
-   - `stop_sequences`、`top_k`、`metadata.user_id`、`tool_result.is_error`。
-6. **客户端伪装自洽性**：
+6. **安全丢弃字段**（上游无对应能力，对齐原版行为）：
+   - Anthropic 入站：`stop_sequences`、`top_k`、`metadata.user_id`、`tool_result.is_error`。
+   - Responses/Chat 入站追加：`truncation`、`include`、`background`、`service_tier`、`prompt_cache_key`、`safety_identifier`、`user`、`metadata`、`text`（format/verbosity）、`top_logprobs`、`stream_options`、`logprobs`、`response_format`/`text.format`（结构化输出，安全丢弃不转换）；Chat 追加 `stop`（不映射、不落 `out.StopSequences`）、`frequency_penalty`、`presence_penalty`、`logit_bias`、`store`、`prediction`、`extra_body`（无类型字段由 `types.ChatIgnoredFields(raw)` 探测存在性后留痕）；Chat 的 `n>1` 直接 400。
+   - `reasoning.encrypted_content` 丢弃**不留痕**（Codex 每轮必发，留痕会淹没日志）。
+   - 所有丢弃必须留痕（`info:` 前缀为良性观测，其余 warn），两条入站路径口径一致（空 tool_result 归一化为 `""`、effort 档位收窄 `minimal→low`、`xhigh/max→high`）。
+7. **客户端伪装自洽性**：
    - 指纹/Lifecycle/信封 Environment/WorkingDir 全套对齐 Windows x64。
    - 出站 Transport 强制 `HTTP/1.1` 且置空 `User-Agent`（Go 中 `h.Set("User-Agent", "")` 可抑制默认 UA）。
-7. **Token Usage 换算**：优先采用上游 `inputTokenDetails.noCacheTokens` 原生非缓存输入；缺失时回退到 `max(0, inputTokens − cachedInputTokens)`，严禁改回无脑透传（详见下节）。
+8. **Token Usage 换算**：优先采用上游 `inputTokenDetails.noCacheTokens` 原生非缓存输入；缺失时回退到 `max(0, inputTokens − cachedInputTokens)`，严禁改回无脑透传（详见下节）。
 
 ---
 
@@ -70,6 +81,16 @@ input_tokens = (inputTokenDetails.noCacheTokens != nil) ? noCacheTokens : max(0,
 - 优先读取上游原生 `noCacheTokens`；若缺失则执行减法兜底。
 - 在「多步求和」与「总量含缓存」两种模型下均等于真实消耗，且与上游后台总输入一致。
 - 抽验指标：网关 `input_tokens` 必须与 cmdc 后台总输入统计对齐。
+
+### 4. 出站协议的 usage 回填（2026-09-17 定案）
+
+内部 canonical 保持上述 noCacheTokens 口径**不变**；Responses/Chat 出站按其协议语义（input/prompt tokens 为**含缓存总量**，与 Anthropic 协议相反）做加法回填，换算统一走 `types.ResponsesUsageFromDelta`（单一实现，流式/非流式共用）：
+
+```text
+input_tokens / prompt_tokens = noCache + cache_read (+ cache_creation 若 >0)
+input_tokens_details.cached_tokens / prompt_tokens_details.cached_tokens = cache_read
+total_tokens = input_tokens + output_tokens
+```
 
 ---
 
@@ -111,6 +132,12 @@ input_tokens = (inputTokenDetails.noCacheTokens != nil) ? noCacheTokens : max(0,
    - `content` 恒为块数组。
 4. **CLI 版本动态获取**：CC CLI 版本号每 24h 从 npm registry 动态同步（fallback `1.50.1`）。
 5. **Go 默认 HTTP 行为**：Go `net/http` 默认协商 HTTP/2 且携带 `Go-http-client` UA，必须在 Transport 强制 `HTTP/1.1` 并显式抑制 UA。
+6. **Responses/Chat 协议事实**（2026-09-17 新增）：
+   - `output_item.added` 必须带 item 名字（function_call 靠 name 路由），名字晚到时须延迟宣告并重放缓冲参数。
+   - 交错思考（text→thinking）时必须先关旧 item 再开新 item，否则 `response.completed` 只带 reasoning（「成功但无输出」）；`content_index` 只在 part 关闭时推进，否则同 item 第二个 part 覆盖第一个。
+   - 流式 `message_start` 级事件在管线中先缓冲（延迟 200 语义），首帧前错误回退 JSON。
+   - cmdc 上游 content part 的线格式是 `tool-call`/`tool-result` + `toolCallId`/`toolName`（挂在 role `"tool"` 消息上），**不是** Anthropic 的 `tool_use`/`tool_result` 命名。
+   - 空 thinking 块出站只丢「空且无签名」的（带签名的必须发，客户端回放需要）；出站伪造签名沿用 `FakeThinkingSignature`，作为 Responses 的 `encrypted_content` 下发可自洽往返（入站还原为 thinking 块、发上游前过滤）。
 
 ---
 

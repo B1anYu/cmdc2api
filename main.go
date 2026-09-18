@@ -1,4 +1,4 @@
-// Package main 为 cmdc2api 程序入口：Anthropic Messages → cmdc 单跳直转反向代理。
+// Package main 为 cmdc2api 程序入口：多协议入站（Anthropic Messages / OpenAI Responses / Chat Completions）→ cmdc 单跳直转反向代理。
 package main
 
 import (
