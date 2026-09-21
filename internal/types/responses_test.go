@@ -876,8 +876,15 @@ func TestResponsesIgnoredFields(t *testing.T) {
 		{"单个", `{"metadata":{}}`, []string{"metadata"}},
 		{
 			"多个按声明顺序",
+			// prompt_cache_key 已从本表移除：它被消费为会话亲和候选（见
+			// ResponsesRequest.PromptCacheKey），不再是丢弃项，故不应出现在这里。
 			`{"stream_options":{"include_usage":true},"text":{"format":"x"},"service_tier":"auto","prompt_cache_key":"k","user":"u"}`,
-			[]string{"service_tier", "prompt_cache_key", "user", "text", "stream_options"},
+			[]string{"service_tier", "user", "text", "stream_options"},
+		},
+		{
+			"prompt_cache_key 已被消费，不再报 ignored",
+			`{"prompt_cache_key":"cache-key-abcdef"}`,
+			nil,
 		},
 		{"空报文", ``, nil},
 		{"非法报文", `{`, nil},

@@ -1080,3 +1080,21 @@ func TestChatToRequest_WarnAggregationKeepsDistinctTools(t *testing.T) {
 	assertWarnsContain(t, warns, `tool call "a": arguments are not valid JSON`)
 	assertWarnsContain(t, warns, `tool call "b": arguments are not valid JSON`)
 }
+
+// F5 第二半：Chat 的 prompt_cache_key 搬运到规范请求，作为会话亲和候选
+// （再由 PrefixCacheKey 采纳；显式 session 请求头仍优先）。未声明时保持为空，
+// 交由前缀哈希派生。
+func TestChatToRequest_PromptCacheKeyPropagates(t *testing.T) {
+	req, _ := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[{"role":"user","content":"q"}],"prompt_cache_key":"cache-key-abcdef"}`))
+	if req.PromptCacheKey != "cache-key-abcdef" {
+		t.Errorf("PromptCacheKey = %q, want the client value propagated", req.PromptCacheKey)
+	}
+	if got := PrefixCacheKey(req); got == PrefixCacheKey(&types.Request{Model: "m", Messages: req.Messages}) {
+		t.Errorf("session key must differ from the content-derived one when prompt_cache_key is set")
+	}
+
+	plain, _ := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[{"role":"user","content":"q"}]}`))
+	if plain.PromptCacheKey != "" {
+		t.Errorf("PromptCacheKey = %q, want empty when the client did not declare one", plain.PromptCacheKey)
+	}
+}

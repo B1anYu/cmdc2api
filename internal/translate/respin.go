@@ -86,6 +86,12 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 		// （否则本端点永远拿不到断点，只剩会话亲和一条缓存路径）。
 		SynthesizeTailCacheMarker: true,
 	}
+	// prompt_cache_key 被消费为会话亲和候选（不再是「ignored」字段）。此处只搬运值，
+	// 最终是否采用由会话解析决定（显式 session 请求头优先），故不在此处留痕——
+	// 它既不是丢弃项，也没有信息损失。依据 A 级参照 proxy.mjs:204-210。
+	if req.PromptCacheKey != nil {
+		out.PromptCacheKey = *req.PromptCacheKey
+	}
 
 	s := &respinState{mapping: &ResponsesToolMapping{}}
 	// instructions 是全局指令，占 system 首段；input 里的 system/developer item 按序并入其后。
@@ -163,7 +169,6 @@ var responsesIgnoredWarnReasons = map[string]string{
 	"truncation":          "info: truncation ignored (upstream applies its own context-window handling)",
 	"background":          "background ignored (upstream has no async execution mode)",
 	"service_tier":        "info: service_tier ignored (upstream has no service-tier selection)",
-	"prompt_cache_key":    "info: prompt_cache_key ignored (prompt caching follows the derived session key)",
 	"safety_identifier":   "info: safety_identifier ignored (upstream has no end-user attribution field)",
 	"user":                "info: user ignored (upstream has no end-user attribution field)",
 	"metadata":            "info: metadata ignored (upstream has no metadata field)",

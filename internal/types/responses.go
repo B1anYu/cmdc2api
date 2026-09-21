@@ -30,12 +30,15 @@ type ResponsesRequest struct {
 	Reasoning          *ResponsesReasoning `json:"reasoning,omitempty"`
 	PreviousResponseID string              `json:"previous_response_id,omitempty"`
 	Store              *bool               `json:"store,omitempty"`
+	// PromptCacheKey 被**消费**（作为会话亲和的候选键，见 types.Request.PromptCacheKey），
+	// 故不再列在 responsesIgnoredFields 里——它既不是丢弃项，也就不该报「ignored」。
+	PromptCacheKey *string `json:"prompt_cache_key,omitempty"`
 }
 
 // responsesIgnoredFields 声明「客户端会发、但上游无对应能力」的字段。
 // 顺序固定，保证同一请求的 warns 输出可复现。
 var responsesIgnoredFields = []string{
-	"include", "truncation", "background", "service_tier", "prompt_cache_key",
+	"include", "truncation", "background", "service_tier",
 	"safety_identifier", "user", "metadata", "text", "parallel_tool_calls",
 	"top_logprobs", "stream_options",
 }

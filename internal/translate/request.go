@@ -170,10 +170,23 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 	return cc, warns
 }
 
-// PrefixCacheKey 从可缓存前缀（system + tools + 首条用户消息文本）计算派生稳定会话 ID。
-// 同一对话的前缀在多轮交互中保持不变，确保命中上游按会话粒度的 Prompt Cache；
-// 当工具定义、系统提示词或首条消息发生压缩/变更时自动切换会话。
+// PrefixCacheKey 决定本次请求的**派生会话键**（会话亲和把它当候选；显式 session 请求头仍优先）。
+//
+// 来源二选一：
+//   - 客户端显式声明了 prompt_cache_key（OpenAI Chat/Responses 字段，长度 ≥8 才采用）——
+//     这是客户端对「这条对话属于哪个缓存前缀」的显式声明，比我们从内容派生的哈希更权威，
+//     口径对齐 A 级参照 reference/commandcode-proxy/proxy.mjs:204-210；
+//   - 否则从可缓存前缀（system + tools + 首条用户消息文本）派生：同一对话的前缀在多轮
+//     交互中保持不变，确保命中上游按会话粒度的 Prompt Cache；当工具定义、系统提示词或
+//     首条消息发生压缩/变更时自动切换会话。
+//
+// 本函数输出还会进入 WorkingDirForSession 与上游请求头，故无论哪个来源都**统一再哈希一次**
+// 并格式化为 UUID 形状，避免客户端可控字符串直接外泄到这些位置。
 func PrefixCacheKey(req *types.Request) string {
+	if k := req.PromptCacheKey; len(k) >= 8 {
+		sum := sha256.Sum256([]byte("prompt_cache_key:" + k))
+		return uuidShape(hex.EncodeToString(sum[:]))
+	}
 	h := sha256.New()
 	sys, _ := parseSystem(req.System)
 	_, _ = fmt.Fprintf(h, "system:%s\n", sys)
@@ -198,8 +211,11 @@ func PrefixCacheKey(req *types.Request) string {
 		first = first[:4096]
 	}
 	_, _ = fmt.Fprintf(h, "first:%s", first)
-	sum := hex.EncodeToString(h.Sum(nil))
-	// 格式化为 UUID 形状（8-4-4-4-12）
+	return uuidShape(hex.EncodeToString(h.Sum(nil)))
+}
+
+// uuidShape 把十六进制摘要的前 32 个字符格式化为 UUID 形状（8-4-4-4-12）。
+func uuidShape(sum string) string {
 	return sum[0:8] + "-" + sum[8:12] + "-" + sum[12:16] + "-" + sum[16:20] + "-" + sum[20:32]
 }
 

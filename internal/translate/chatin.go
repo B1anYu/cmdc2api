@@ -52,6 +52,12 @@ func chatToRequest(req *types.ChatRequest) (*types.Request, []string, error) {
 		// 在末尾合成（否则本端点永远拿不到断点，只剩会话亲和一条缓存路径）。
 		SynthesizeTailCacheMarker: true,
 	}
+	// prompt_cache_key 被消费为会话亲和候选：它以一条显式声明替代「前缀哈希派生」，
+	// 最终是否采用由会话解析决定（显式 session 请求头优先）。它不是丢弃项，故不留痕。
+	// 依据 A 级参照 proxy.mjs:204-210。
+	if req.PromptCacheKey != nil {
+		out.PromptCacheKey = *req.PromptCacheKey
+	}
 	// max_completion_tokens 是 max_tokens 的新名；两者同时出现时以前者为准（OpenAI 语义）。
 	// ≤0 不在这里兜底：由 BuildCcRequest 统一填充默认上限。
 	switch {

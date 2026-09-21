@@ -75,7 +75,6 @@ func TestBuildCcRequest_SystemArrayToStringAndCacheMarker(t *testing.T) {
 	}
 }
 
-// F3：客户端 part 级 cache_control 的 ttl 必须原样到达出站信封（绝不覆写、绝不合成）。
 // envelopeTailMarker 返回「信封尾部第一个 text part」上的断点标记（从整体末尾向前回扫），
 // 落点定义与 synthesizeCacheMarker 完全一致，供各入站路径的合成断言共用。
 func envelopeTailMarker(cc *types.CcRequest) *types.CacheControl {
@@ -90,6 +89,7 @@ func envelopeTailMarker(cc *types.CcRequest) *types.CacheControl {
 	return nil
 }
 
+// F3：客户端 part 级 cache_control 的 ttl 必须原样到达出站信封（绝不覆写、绝不合成）。
 func TestBuildCcRequest_CacheControlTTLPreservedVerbatim(t *testing.T) {
 	req := parseReq(t, `{
 		"max_tokens": 10,
@@ -683,3 +683,59 @@ func warnContaining(t *testing.T, warns []string, sub string) string {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// F5 第二半：prompt_cache_key 是客户端对「这条对话属于哪个缓存前缀」的显式声明，
+// 优先于内容派生（依据 A 级参照 proxy.mjs:204-210），但会被再哈希成 UUID 形状，
+// 不把客户端可控字符串外泄到 WorkingDir/上游请求头。
+func TestPrefixCacheKey_PromptCacheKeyTakesPrecedence(t *testing.T) {
+	base := func() *types.Request {
+		return &types.Request{
+			Model:    "m",
+			System:   json.RawMessage(`"sys"`),
+			Messages: []types.InboundMessage{{Role: "user", Content: json.RawMessage(`"q"`)}},
+		}
+	}
+
+	derived := PrefixCacheKey(base())
+	if len(derived) != 36 {
+		t.Fatalf("derived session key = %q, want UUID shape", derived)
+	}
+
+	withKey := base()
+	withKey.PromptCacheKey = "cache-key-abcdef"
+	k1 := PrefixCacheKey(withKey)
+	if k1 == derived {
+		t.Errorf("prompt_cache_key must take precedence over the content-derived prefix")
+	}
+	if k2 := PrefixCacheKey(withKey); k2 != k1 {
+		t.Errorf("not stable across calls: %q vs %q", k1, k2)
+	}
+
+	other := base()
+	other.PromptCacheKey = "cache-key-zzzzzz"
+	if PrefixCacheKey(other) == k1 {
+		t.Errorf("distinct prompt_cache_key values must not collide")
+	}
+
+	// 客户端声明优先：内容完全不同、但同一个 prompt_cache_key → 同一会话键
+	different := base()
+	different.Messages = []types.InboundMessage{{Role: "user", Content: json.RawMessage(`"totally different"`)}}
+	different.PromptCacheKey = "cache-key-abcdef"
+	if PrefixCacheKey(different) != k1 {
+		t.Errorf("same prompt_cache_key must win over content differences")
+	}
+
+	// 长度门槛：< 8 字符不采用（对齐参照 proxy.mjs:204-210）
+	short := base()
+	short.PromptCacheKey = "abc"
+	if PrefixCacheKey(short) != derived {
+		t.Errorf("prompt_cache_key shorter than 8 chars must be ignored")
+	}
+
+	if strings.Contains(k1, "cache-key-abcdef") {
+		t.Errorf("raw client key leaked into session id: %q", k1)
+	}
+	if len(k1) != 36 {
+		t.Errorf("session key = %q, want UUID shape", k1)
+	}
+}

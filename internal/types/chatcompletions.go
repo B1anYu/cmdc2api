@@ -24,8 +24,11 @@ type ChatRequest struct {
 	ToolChoice        json.RawMessage `json:"tool_choice,omitempty"` // string | object
 	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
 	ReasoningEffort   json.RawMessage `json:"reasoning_effort,omitempty"` // string | {effort,summary}
-	User              string          `json:"user,omitempty"`
-	Seed              *int            `json:"seed,omitempty"`
+	// PromptCacheKey 被**消费**（作为会话亲和的候选键，见 types.Request.PromptCacheKey），
+	// 故不列入 chatIgnoredFields：它既不是丢弃项，也就不该报「ignored」。
+	PromptCacheKey *string `json:"prompt_cache_key,omitempty"`
+	User           string  `json:"user,omitempty"`
+	Seed           *int    `json:"seed,omitempty"`
 	// N 采样数：仅支持 1（上游无多候选生成），>1 由归一化层拒绝。
 	N              *int            `json:"n,omitempty"`
 	Logprobs       *bool           `json:"logprobs,omitempty"`

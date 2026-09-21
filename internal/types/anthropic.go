@@ -22,6 +22,14 @@ type Request struct {
 	Thinking      json.RawMessage  `json:"thinking,omitempty"`
 	Metadata      *Metadata        `json:"metadata,omitempty"`
 
+	// PromptCacheKey 客户端显式声明的「这条对话属于哪个缓存前缀」（OpenAI Chat 与
+	// Responses 都有的字段；Anthropic Messages 无此字段，故恒为空）。
+	// 会话亲和把它当作**候选会话键**：显式 session 请求头 > 本字段 > 前缀哈希派生。
+	// 依据：A 级参照 reference/commandcode-proxy/proxy.mjs:204-210 把
+	// prompt_cache_key（长度 ≥8）作为 x-session-id 候选之一。
+	// 仅供入站归一化层设置，绝不来自客户端 JSON。
+	PromptCacheKey string `json:"-"`
+
 	// SynthesizeTailCacheMarker 标记「本入站协议无法表达 part 级缓存断点」——
 	// OpenAI 的 Chat Completions 与 Responses 都没有 cache_control 字段，故代理在
 	// 信封末尾合成断点（见 translate.synthesizeCacheMarker）是它们拿到缓存断点的

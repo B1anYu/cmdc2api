@@ -1342,3 +1342,26 @@ func TestResponsesToRequest_ComposesWithBuildCcRequest(t *testing.T) {
 		t.Errorf("tail cache_control marker = %+v, want a synthesized {type:ephemeral}", m)
 	}
 }
+
+// F5 第二半：Responses 的 prompt_cache_key 同样搬运为会话亲和候选，且它已从
+// 「安全丢弃字段」名单移除——不应再出现 prompt_cache_key ignored 的留痕。
+func TestResponsesToRequest_PromptCacheKeyPropagates(t *testing.T) {
+	out, _, warns := respin(t, `{
+		"model": "m",
+		"input": "hi",
+		"prompt_cache_key": "cache-key-abcdef"
+	}`)
+	if out.PromptCacheKey != "cache-key-abcdef" {
+		t.Errorf("PromptCacheKey = %q, want the client value propagated", out.PromptCacheKey)
+	}
+	for _, w := range warns {
+		if strings.Contains(w, "prompt_cache_key") {
+			t.Errorf("prompt_cache_key is consumed now, must not be reported as ignored: %q", w)
+		}
+	}
+
+	plain, _, _ := respin(t, `{"model":"m","input":"hi"}`)
+	if plain.PromptCacheKey != "" {
+		t.Errorf("PromptCacheKey = %q, want empty when the client did not declare one", plain.PromptCacheKey)
+	}
+}
