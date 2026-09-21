@@ -76,6 +76,20 @@ func TestBuildCcRequest_SystemArrayToStringAndCacheMarker(t *testing.T) {
 }
 
 // F3：客户端 part 级 cache_control 的 ttl 必须原样到达出站信封（绝不覆写、绝不合成）。
+// envelopeTailMarker 返回「信封尾部第一个 text part」上的断点标记（从整体末尾向前回扫），
+// 落点定义与 synthesizeCacheMarker 完全一致，供各入站路径的合成断言共用。
+func envelopeTailMarker(cc *types.CcRequest) *types.CacheControl {
+	for i := len(cc.Params.Messages) - 1; i >= 0; i-- {
+		parts := cc.Params.Messages[i].Content
+		for j := len(parts) - 1; j >= 0; j-- {
+			if parts[j].Type == "text" {
+				return parts[j].CacheControl
+			}
+		}
+	}
+	return nil
+}
+
 func TestBuildCcRequest_CacheControlTTLPreservedVerbatim(t *testing.T) {
 	req := parseReq(t, `{
 		"max_tokens": 10,

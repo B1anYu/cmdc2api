@@ -82,6 +82,9 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
 		MaxTokens:   req.MaxOutputTokens, // ≤0 交给 BuildCcRequest 统一兜底 64000
+		// OpenAI Responses 协议没有 cache_control 字段，信封断点只能由代理在末尾合成
+		// （否则本端点永远拿不到断点，只剩会话亲和一条缓存路径）。
+		SynthesizeTailCacheMarker: true,
 	}
 
 	s := &respinState{mapping: &ResponsesToolMapping{}}

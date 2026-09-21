@@ -106,7 +106,14 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 			len(markerIdx), markerIdx))
 	}
 
-	synthesizeCacheMarker(ccMsgs, sysCC || toolsCC || replaceMarkers, replaceMarkers, &warns)
+	// 断点合成的三个来源：
+	//   ① 客户端把标记打在 system/tools 上（信封无对应字段，只能折算到 part 级）；
+	//   ② CC_CACHE_MARKERS=replace 强制合成（仅 A/B 诊断）；
+	//   ③ 入站协议本就没有 cache_control 字段（OpenAI Chat/Responses）——见
+	//      types.Request.SynthesizeTailCacheMarker 的说明。
+	// synthesizeCacheMarker 内部若发现信封里已有任一 part 级标记则直接返回，
+	// 故 ①③ 都不会覆写客户端标记。
+	synthesizeCacheMarker(ccMsgs, sysCC || toolsCC || replaceMarkers || req.SynthesizeTailCacheMarker, replaceMarkers, &warns)
 
 	model := req.Model
 	if model == "" {
@@ -618,7 +625,7 @@ func synthesizeCacheMarker(msgs []types.CcMessage, need, force bool, warns *[]st
 				msgs[i].Content[j].CacheControl = &types.CacheControl{Type: "ephemeral"}
 				if !force {
 					*warns = append(*warns,
-						"no part-level cache_control found on inbound messages; synthesized breakpoint on the envelope tail's last text part (system/tools markers folded — the cmdc envelope has no fields to carry them)")
+						"no part-level cache_control present in the envelope; synthesized a breakpoint on the tail's last text part. The inbound request carried no usable part-level marker, which happens when either (a) it declared cache_control only on system/tools and the cmdc envelope has no field to carry those, or (b) its protocol has no cache_control field at all (OpenAI Chat/Responses).")
 				}
 				return
 			}

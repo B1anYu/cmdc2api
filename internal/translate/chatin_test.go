@@ -563,9 +563,15 @@ func TestChatToRequest_DroppedFieldsWarned(t *testing.T) {
 			_, warns := mustChatToRequest(t, chatReq(t,
 				`{"model":"m","messages":[{"role":"user","content":"q"}],`+tc.field+`}`))
 			assertWarnsContain(t, warns, tc.wantWarn)
-			for _, w := range warns {
-				if strings.Contains(w, strings.TrimPrefix(tc.wantWarn, "info: ")) && !tc.infoOnly {
-					continue
+			// 分级断言（F19：此前这个循环体只有 continue，属真空转，tc.infoOnly 从未被校验）。
+			// infoOnly 项由 wantWarn 自带的 "info: " 前缀钉住；非 infoOnly 项必须**不**带
+			// 该前缀 —— 行为性丢失按 WARN 计，若被降级成良性观测应在此报错。
+			if !tc.infoOnly {
+				needle := strings.TrimPrefix(tc.wantWarn, "info: ")
+				for _, w := range warns {
+					if strings.Contains(w, needle) && strings.HasPrefix(w, "info: ") {
+						t.Errorf("%s: want a WARN-level record, got an info:-prefixed one (%q)", tc.name, w)
+					}
 				}
 			}
 		})
@@ -681,9 +687,16 @@ func TestChatToRequest_ComposesWithBuildCcRequest(t *testing.T) {
 		t.Errorf("tools = %+v", cc.Params.Tools)
 	}
 	// stop 属于安全丢弃字段（上游无 stop 能力），归一化阶段既不映射也不消费，
-	// 因此信封构造不会再收到 stop_sequences，warns 为空。
-	if len(warns) != 0 {
-		t.Errorf("unexpected warns: %v", warns)
+	// 因此信封构造不会再收到 stop_sequences；但因 F5，Chat 入站会在信封末尾
+	// **合成**一个缓存断点（本协议没有 cache_control 字段可用），故这里断言
+	// 合成确实发生 + 只有这一条告警。旧断言是「warns 为空」，钉的是修复前
+	// 「新端点永不断点」的行为，已随 F5 更新。
+	assertWarnsContain(t, warns, "no part-level cache_control present in the envelope")
+	if len(warns) != 1 {
+		t.Errorf("warns = %v, want exactly the synthesized-breakpoint notice", warns)
+	}
+	if m := envelopeTailMarker(cc); m == nil || m.Type != "ephemeral" {
+		t.Errorf("tail cache_control marker = %+v, want a synthesized {type:ephemeral}", m)
 	}
 }
 

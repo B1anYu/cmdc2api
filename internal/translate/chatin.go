@@ -48,6 +48,9 @@ func chatToRequest(req *types.ChatRequest) (*types.Request, []string, error) {
 		Stream:      req.Stream,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
+		// OpenAI Chat Completions 协议没有 cache_control 字段，信封断点只能由代理
+		// 在末尾合成（否则本端点永远拿不到断点，只剩会话亲和一条缓存路径）。
+		SynthesizeTailCacheMarker: true,
 	}
 	// max_completion_tokens 是 max_tokens 的新名；两者同时出现时以前者为准（OpenAI 语义）。
 	// ≤0 不在这里兜底：由 BuildCcRequest 统一填充默认上限。

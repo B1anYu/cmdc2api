@@ -21,6 +21,16 @@ type Request struct {
 	ToolChoice    json.RawMessage  `json:"tool_choice,omitempty"`
 	Thinking      json.RawMessage  `json:"thinking,omitempty"`
 	Metadata      *Metadata        `json:"metadata,omitempty"`
+
+	// SynthesizeTailCacheMarker 标记「本入站协议无法表达 part 级缓存断点」——
+	// OpenAI 的 Chat Completions 与 Responses 都没有 cache_control 字段，故代理在
+	// 信封末尾合成断点（见 translate.synthesizeCacheMarker）是它们拿到缓存断点的
+	// 唯一手段。Anthropic Messages 入站**不设置**本标志：它本就能表达 part 级标记，
+	// 是否在「无任何标记时也合成」属另一个未决的设计问题（见 fix-plan §十），
+	// 本轮不改变其现有行为。
+	//
+	// 仅供入站归一化层（chatin.go / respin.go）设置，绝不来自客户端 JSON。
+	SynthesizeTailCacheMarker bool `json:"-"`
 }
 
 type InboundMessage struct {

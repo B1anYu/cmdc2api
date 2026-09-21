@@ -1332,7 +1332,13 @@ func TestResponsesToRequest_ComposesWithBuildCcRequest(t *testing.T) {
 	if !sawTool || !sawUser {
 		t.Errorf("messages = %+v, want a tool message and a user message", cc.Params.Messages)
 	}
-	if len(warns) != 0 {
-		t.Errorf("unexpected warns: %v", warns)
+	// F5：Responses 入站协议没有 cache_control 字段，信封断点由代理在末尾合成，
+	// 故这里断言合成确实发生 + 只有这一条告警（旧断言「warns 为空」钉的是修复前的行为）。
+	assertWarnsContain(t, warns, "no part-level cache_control present in the envelope")
+	if len(warns) != 1 {
+		t.Errorf("warns = %v, want exactly the synthesized-breakpoint notice", warns)
+	}
+	if m := envelopeTailMarker(cc); m == nil || m.Type != "ephemeral" {
+		t.Errorf("tail cache_control marker = %+v, want a synthesized {type:ephemeral}", m)
 	}
 }
