@@ -408,20 +408,22 @@ func TestResponsesItemWire_CustomToolCallKeepsEmptyInput(t *testing.T) {
 	requireNoKeys(t, m, "arguments", "execution")
 }
 
+// TestResponsesItemWire_ToolSearchArgumentsIsObject tool_search_call 的 arguments 线上恒为对象。
+// 用例只覆盖生产可达的输入：respout 侧只传 nil 或 map[string]any（参数原文的 JSON 解析
+// 已经在出站侧完成），因此不再为 string / RawMessage / []byte 这类无调用点的分支留子用例。
 func TestResponsesItemWire_ToolSearchArgumentsIsObject(t *testing.T) {
+	// 参数原文恰为 "null" 时 json.Unmarshal 不报错也不填 map，留下的是 typed-nil map：
+	// 它逃得过 `case nil`，原样下发会让线上出现 arguments:null（#4）。
+	var typedNil map[string]any
 	cases := []struct {
 		label string
 		in    any
 		want  map[string]any
 	}{
 		{"nil", nil, map[string]any{}},
+		{"typed-nil map（参数原文为 null）", typedNil, map[string]any{}},
+		{"空 map", map[string]any{}, map[string]any{}},
 		{"对象", map[string]any{"query": "slack"}, map[string]any{"query": "slack"}},
-		{"JSON 字符串", `{"limit":3}`, map[string]any{"limit": float64(3)}},
-		{"RawMessage", json.RawMessage(`{"query":"x"}`), map[string]any{"query": "x"}},
-		{"字节切片", []byte(`{"query":"y"}`), map[string]any{"query": "y"}},
-		{"其它对象类型", map[string]string{"query": "z"}, map[string]any{"query": "z"}},
-		{"非法字符串", "not json", map[string]any{}},
-		{"空字符串", "", map[string]any{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.label, func(t *testing.T) {
@@ -429,6 +431,9 @@ func TestResponsesItemWire_ToolSearchArgumentsIsObject(t *testing.T) {
 			requireKeys(t, m, "type", "id", "call_id", "execution", "arguments", "status")
 			if m["type"] != "tool_search_call" || m["execution"] != "client" {
 				t.Fatalf("item = %v", m)
+			}
+			if m["arguments"] == nil {
+				t.Fatalf("arguments = null（线上必须是对象）: %#v", m["arguments"])
 			}
 			if !reflect.DeepEqual(m["arguments"], tc.want) {
 				t.Fatalf("arguments = %#v, want %#v（线上必须是对象）", m["arguments"], tc.want)
@@ -560,7 +565,6 @@ func TestResponsesResponseWire_RequiredTopLevelFields(t *testing.T) {
 func TestResponsesResponseWire_EchoFields(t *testing.T) {
 	strict := true
 	temp := 0.7
-	topP := 0.9
 	maxOut := 4096
 	resp := ResponsesResponse{
 		ID:                "resp_1",
@@ -571,13 +575,14 @@ func TestResponsesResponseWire_EchoFields(t *testing.T) {
 		Tools:             []ResponsesTool{{Type: ResponsesToolFunction, Name: "get_weather", Parameters: json.RawMessage(`{"type":"object"}`), Strict: &strict}},
 		ToolChoice:        json.RawMessage(`{"type":"function","name":"get_weather"}`),
 		Temperature:       &temp,
-		TopP:              &topP,
 		MaxOutputTokens:   &maxOut,
 		ParallelToolCalls: true,
 	}
 	m := jsonMap(t, resp)
-	requireKeys(t, m, "instructions", "tools", "tool_choice", "temperature", "top_p",
+	requireKeys(t, m, "instructions", "tools", "tool_choice", "temperature",
 		"max_output_tokens", "parallel_tool_calls", "previous_response_id", "store")
+	// top_p 键恒不出现：该参数从未到达上游，回显等于谎报（#14）
+	requireNoKeys(t, m, "top_p")
 	if m["instructions"] != "be terse" {
 		t.Fatalf("instructions = %v", m["instructions"])
 	}
@@ -606,12 +611,12 @@ func TestResponsesResponseWire_EchoFields(t *testing.T) {
 
 	// instructions 为空则不出键；缺省回显值按 OpenAI 默认。
 	bare := jsonMap(t, ResponsesResponse{ID: "resp_2", CreatedAt: 1, Status: ResponsesStatusInProgress})
-	requireNoKeys(t, bare, "instructions", "incomplete_details", "error")
+	requireNoKeys(t, bare, "instructions", "incomplete_details", "error", "top_p")
 	if bare["tool_choice"] != "auto" {
 		t.Fatalf("缺省 tool_choice = %v, want auto", bare["tool_choice"])
 	}
-	requireKeys(t, bare, "temperature", "top_p", "max_output_tokens")
-	if bare["temperature"] != nil || bare["top_p"] != nil || bare["max_output_tokens"] != nil {
+	requireKeys(t, bare, "temperature", "max_output_tokens")
+	if bare["temperature"] != nil || bare["max_output_tokens"] != nil {
 		t.Fatalf("未设置的可选回显字段必须是 null：%v", bare)
 	}
 

@@ -790,6 +790,42 @@ func TestResponsesOut_ToolArgsSharding(t *testing.T) {
 	}
 }
 
+// TestResponsesOut_ToolSearchArgumentsNeverNull 参数原文恰为 null 时，
+// done item 的 arguments 必须是对象而非 null（#4）：上游给出的是 JSON 字符串 "null"
+// （partialJSON 会把裸 null 折成 "{}"，只有字符串形态能走到这条路径），
+// 出站解析后得到 typed-nil map——codex 物化该调用时不接受非对象。
+func TestResponsesOut_ToolSearchArgumentsNeverNull(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"字符串 null", `"null"`},
+		{"空对象", `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			enc := NewResponsesEncoder("test-model", "resp_x", respGoldens())
+			_, payloads := respRun(t, enc, respStreamEvents(t,
+				`{"type":"tool-call","toolCallId":"toolu_1","toolName":"tool_search","input":`+tc.input+`}`,
+				`{"type":"finish","finishReason":"tool-calls","totalUsage":{"inputTokens":1,"outputTokens":9}}`))
+			out := respList(t, respTerminal(t, payloads), "output")
+			if len(out) != 1 {
+				t.Fatalf("output = %d 项, want 1", len(out))
+			}
+			item := out[0].(map[string]any)
+			if item["type"] != types.ResponsesItemToolSearchCall {
+				t.Fatalf("item 类型 = %v", item["type"])
+			}
+			if item["arguments"] == nil {
+				t.Fatalf("arguments = null，线上必须是对象: %v", item)
+			}
+			if got := mustJSON(t, item["arguments"]); got != "{}" {
+				t.Errorf("arguments = %s, want {}", got)
+			}
+		})
+	}
+}
+
 // TestResponsesOut_CustomInputUnwrap custom 工具的降级参数解包规则。
 func TestResponsesOut_CustomInputUnwrap(t *testing.T) {
 	cases := []struct {
@@ -910,6 +946,141 @@ func TestResponsesOut_ZeroOutputErrorPath(t *testing.T) {
 	}
 }
 
+// TestResponsesOut_ItemPartsClosedOnEveryTerminationPath 「块类型 × 终结路径」矩阵：
+// item 被强制收尾时（流内报错、上游半截断开），已宣告的 part 必须先 done 再关 item。
+//
+// 严格客户端（Codex）收到 reasoning_summary_part.added 后会一直等 part.done / summary_text.done，
+// 只发 output_item.done 会让该 part 永久悬空（#3）。正常 content_block_stop 路径由既有 golden 覆盖，
+// 这里补两条「不经 content_block_stop 的强制收尾」路径——单场景 golden 挡不住这类缺口（D9 教训）。
+//
+// 可达性：流内报错路径真实可达（idle 超时/断流由管线合成 error 事件喂给编码器，
+// 而 StreamTranslator 在 hasError 时不再关块）；半截流路径钉的是编码器自身的 Finish 契约
+// （管线无条件调用 enc.Finish()，不允许残留悬空 part）。
+func TestResponsesOut_ItemPartsClosedOnEveryTerminationPath(t *testing.T) {
+	cases := []struct {
+		name       string
+		lines      []string
+		truncated  bool // true：不喂 StreamTranslator.Finish 的事件，模拟上游半截断开
+		want       []string
+		wantStatus string
+		wantType   string
+		wantText   string
+	}{
+		{
+			name: "思考块 × 流内报错",
+			lines: []string{
+				`{"type":"reasoning-start"}`,
+				`{"type":"reasoning-delta","text":"thinking hard"}`,
+				`{"type":"error","error":{"message":"<429> slow down"}}`,
+			},
+			want: []string{
+				"response.created",
+				"response.in_progress",
+				"response.output_item.added",
+				"response.reasoning_summary_part.added",
+				"response.reasoning_summary_text.delta",
+				// 报错时思考块还开着：摘要 part 必须先收尾，item 才能关
+				"response.reasoning_summary_text.done",
+				"response.reasoning_summary_part.done",
+				"response.output_item.done",
+				"response.failed",
+			},
+			wantStatus: types.ResponsesStatusFailed,
+			wantType:   types.ResponsesItemReasoning,
+			wantText:   "thinking hard",
+		},
+		{
+			name: "思考块 × 上游半截断开",
+			lines: []string{
+				`{"type":"reasoning-start"}`,
+				`{"type":"reasoning-delta","text":"cut off"}`,
+			},
+			truncated: true,
+			want: []string{
+				"response.created",
+				"response.in_progress",
+				"response.output_item.added",
+				"response.reasoning_summary_part.added",
+				"response.reasoning_summary_text.delta",
+				"response.reasoning_summary_text.done",
+				"response.reasoning_summary_part.done",
+				"response.output_item.done",
+				"response.completed",
+			},
+			wantStatus: types.ResponsesStatusCompleted,
+			wantType:   types.ResponsesItemReasoning,
+			wantText:   "cut off",
+		},
+		{
+			name:      "文本块 × 上游半截断开",
+			lines:     []string{`{"type":"text-delta","text":"half a sentence"}`},
+			truncated: true,
+			want: []string{
+				"response.created",
+				"response.in_progress",
+				"response.output_item.added",
+				"response.content_part.added",
+				"response.output_text.delta",
+				"response.output_text.done",
+				"response.content_part.done",
+				"response.output_item.done",
+				"response.completed",
+			},
+			wantStatus: types.ResponsesStatusCompleted,
+			wantType:   types.ResponsesItemMessage,
+			wantText:   "half a sentence",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evs := respStreamEvents(t, tc.lines...)
+			if tc.truncated {
+				evs = respTruncatedStreamEvents(t, tc.lines...)
+			}
+			enc := NewResponsesEncoder("test-model", "resp_x", nil)
+			names, payloads := respRun(t, enc, evs)
+			// respAssertGolden 连带跑 item 配对与 part 成对不变式：
+			// 悬空的 reasoning_summary_part 会被 respAssertPartOrdering 直接抓住。
+			respAssertGolden(t, names, payloads, tc.want, 1)
+
+			resp := respTerminal(t, payloads)
+			if got := resp["status"]; got != tc.wantStatus {
+				t.Errorf("status = %v, want %s", got, tc.wantStatus)
+			}
+			// 失败/断流前已聚合的产出必须留在 output 里，客户端才能还原
+			items := respList(t, resp, "output")
+			if len(items) != 1 {
+				t.Fatalf("output = %d 项, want 1", len(items))
+			}
+			item := items[0].(map[string]any)
+			if item["type"] != tc.wantType {
+				t.Fatalf("output[0].type = %v, want %s", item["type"], tc.wantType)
+			}
+			var text string
+			if tc.wantType == types.ResponsesItemReasoning {
+				text = respStr(t, respList(t, item, "summary")[0].(map[string]any), "text")
+			} else {
+				text = respStr(t, respList(t, item, "content")[0].(map[string]any), "text")
+			}
+			if text != tc.wantText {
+				t.Errorf("output 文本 = %q, want %q", text, tc.wantText)
+			}
+		})
+	}
+}
+
+// respTruncatedStreamEvents 与 respStreamEvents 同源，但**不**调用 StreamTranslator.Finish：
+// 模拟上游没给终止事件就断开，此时「关掉残留块」只能由出站编码器的 Finish 兜底。
+func respTruncatedStreamEvents(t *testing.T, lines ...string) []types.StreamEvent {
+	t.Helper()
+	tr := NewStreamTranslator("test-model", "msg_upstream")
+	evs := tr.Start()
+	for _, l := range lines {
+		evs = append(evs, tr.Feed([]byte(l))...)
+	}
+	return evs
+}
+
 // TestResponsesOut_RefusalIncomplete refusal 停止原因映射为 content_filter。
 func TestResponsesOut_RefusalIncomplete(t *testing.T) {
 	enc := NewResponsesEncoder("test-model", "resp_x", nil)
@@ -1020,9 +1191,12 @@ func TestResponsesOut_UsageLastWriteWins(t *testing.T) {
 
 // TestResponsesOut_EchoFields 终态 response 必须回显请求字段（Codex 做浅校验），
 // 并且恒带 previous_response_id:null 与 store:false（本代理不保存服务端状态）。
+//
+// top_p 反向钉住：它不在回显字段里（键也不出现）——它从未被转发给上游，
+// 回显它等于谎报参数已生效（#14）。
 func TestResponsesOut_EchoFields(t *testing.T) {
 	enc := NewResponsesEncoder("test-model", "resp_echo", nil)
-	temp, topP, maxOut := 0.2, 0.9, 4096
+	temp, maxOut := 0.2, 4096
 	enc.SetEcho(ResponsesEcho{
 		Instructions: "be nice",
 		Tools: []types.ResponsesTool{{
@@ -1031,7 +1205,6 @@ func TestResponsesOut_EchoFields(t *testing.T) {
 		}},
 		ToolChoice:        json.RawMessage(`{"type":"function","name":"f"}`),
 		Temperature:       &temp,
-		TopP:              &topP,
 		MaxOutputTokens:   &maxOut,
 		ParallelToolCalls: true,
 	})
@@ -1039,11 +1212,14 @@ func TestResponsesOut_EchoFields(t *testing.T) {
 		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":1,"outputTokens":1}}`))
 	resp := respTerminal(t, payloads)
 	for _, key := range []string{"id", "object", "created_at", "status", "output", "usage", "model",
-		"instructions", "tools", "tool_choice", "temperature", "top_p", "max_output_tokens",
+		"instructions", "tools", "tool_choice", "temperature", "max_output_tokens",
 		"parallel_tool_calls", "previous_response_id", "store"} {
 		if _, ok := resp[key]; !ok {
 			t.Errorf("response 缺少字段 %q", key)
 		}
+	}
+	if _, ok := resp["top_p"]; ok {
+		t.Errorf("response 不应回显 top_p（该参数从未到达上游）: %v", resp["top_p"])
 	}
 	if resp["object"] != "response" || resp["store"] != false || resp["previous_response_id"] != nil {
 		t.Errorf("顶层常量字段不对: object=%v store=%v prev=%v",

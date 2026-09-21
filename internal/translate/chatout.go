@@ -176,22 +176,9 @@ func (e *ChatEncoder) chunk(delta types.ChatDelta) []byte {
 	})
 }
 
-// chatUsage 内部 noCache 口径 → OpenAI prompt_tokens 口径的加法回填：
-// Anthropic 的 input_tokens 只计非缓存部分，OpenAI 的 prompt_tokens 含缓存命中，
-// 因此总输入 = 非缓存 + 缓存读取（+ 缓存写入）。cached_tokens 只报缓存读取。
-func (e *ChatEncoder) chatUsage() types.ChatUsage {
-	cached := e.usage.CacheReadInputTokens
-	prompt := e.usage.InputTokens + cached
-	if e.usage.CacheCreationInputTokens != nil && *e.usage.CacheCreationInputTokens > 0 {
-		prompt += *e.usage.CacheCreationInputTokens
-	}
-	return types.ChatUsage{
-		PromptTokens:        prompt,
-		CompletionTokens:    e.usage.OutputTokens,
-		TotalTokens:         prompt + e.usage.OutputTokens,
-		PromptTokensDetails: types.ChatPromptTokensDetails{CachedTokens: cached},
-	}
-}
+// chatUsage 流式收尾的 usage 帧：换算口径与聚合器共用 chatUsageFrom（单一实现），
+// 两处各写一份公式正是流式/非流式语义漂移的温床。
+func (e *ChatEncoder) chatUsage() types.ChatUsage { return chatUsageFrom(e.usage) }
 
 // ---------- 非流式聚合器 ----------
 
@@ -204,7 +191,11 @@ type ChatAggregator struct {
 
 	text      strings.Builder
 	reasoning strings.Builder
-	tools     []chatAggTool
+	// tools 存**指针**而非值：chatAggTool 内含 strings.Builder，按值放进切片时
+	// append 扩容会整体复制 Builder，被复制的 Builder 再被 String() 读取即触发
+	// copyCheck 恐慌（Go 1.26 前的运行时保护）——上游一旦改为分片发参数、同一块
+	// 出现多条 InputJSONDelta 就会踩到。指针切片扩容只复制指针，Builder 身份恒定。
+	tools     []*chatAggTool
 	toolByBlk map[int]int // Anthropic 块序号 → 工具序号（多工具并行时的归属判定）
 
 	stopReason string
@@ -232,7 +223,7 @@ func (a *ChatAggregator) Feed(ev types.StreamEvent) {
 			return
 		}
 		a.toolByBlk[d.Index] = len(a.tools)
-		a.tools = append(a.tools, chatAggTool{id: b.ID, name: b.Name})
+		a.tools = append(a.tools, &chatAggTool{id: b.ID, name: b.Name})
 
 	case types.ContentBlockDeltaEvent:
 		switch dd := d.Delta.(type) {
@@ -272,8 +263,7 @@ func (a *ChatAggregator) Completion() *types.ChatCompletion {
 	if reasoning := a.reasoning.String(); reasoning != "" {
 		msg.ReasoningContent = reasoning
 	}
-	for i := range a.tools {
-		t := &a.tools[i]
+	for _, t := range a.tools {
 		args := t.args.String()
 		if args == "" || !json.Valid([]byte(args)) {
 			// 上游截断或空参数：给空对象，避免毒 JSON 进入客户端会话
@@ -312,12 +302,16 @@ func chatFinishReason(stopReason string) string {
 
 // OpenAIErrorBody OpenAI 形状错误体。type 决定客户端重试分流，code 供程序化判定，
 // param 恒为 null（SDK 按字段存在性解析）。
-// 该表与 server 侧错误出口同源：流内错误帧无法改状态码，只能换形状。
+// **全仓唯一**的 OpenAI 错误体实现：流内错误帧（ChatEncoder.errorFrames）与
+// server 侧开流前错误出口（openaiErrors.Write）都调它，两条路径形状不可能漂移。
 func OpenAIErrorBody(errType, message string) map[string]any {
 	typ, code := openAIErrorShape(errType)
 	return map[string]any{"message": message, "type": typ, "param": nil, "code": code}
 }
 
+// openAIErrorShape Anthropic 错误类型 → OpenAI (type, code)。
+// type 决定客户端的重试分流，code 供程序化判定（如 invalid_api_key 触发换 key），
+// 两者都要给，不能只给其一。改表即改所有 OpenAI 形状出口，勿再抄一份到别处。
 func openAIErrorShape(errType string) (typ, code string) {
 	switch errType {
 	case "authentication_error":
@@ -333,7 +327,10 @@ func openAIErrorShape(errType string) (typ, code string) {
 	}
 }
 
-// chatUsageFrom DeltaUsage → ChatUsage（与编码器同一公式，保证流式/非流式一致）。
+// chatUsageFrom 内部 noCache 口径 → OpenAI prompt_tokens 口径的加法回填，流式（经
+// ChatEncoder.chatUsage）与非流式（ChatAggregator.Completion）共用的**唯一**实现：
+// Anthropic 的 input_tokens 只计非缓存部分，OpenAI 的 prompt_tokens 含缓存命中，
+// 因此总输入 = 非缓存 + 缓存读取（+ 缓存写入）。cached_tokens 只报缓存读取。
 func chatUsageFrom(u types.DeltaUsage) types.ChatUsage {
 	cached := u.CacheReadInputTokens
 	prompt := u.InputTokens + cached

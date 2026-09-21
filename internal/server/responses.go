@@ -67,12 +67,13 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	// 终态事件与非流式响应体都要回显请求字段（Codex 对响应对象做浅校验），
 	// 回显的必须是客户端原始声明，不能是归一化后的 Anthropic 形状。
+	// top_p 刻意不在其列：它从未被转发给上游（BuildCcRequest 只转发 temperature），
+	// 回显等于向客户端谎报参数已生效（见 translate/respout.go 的 ResponsesEcho 注释）。
 	echo := translate.ResponsesEcho{
 		Instructions:    strings.TrimSpace(rreq.Instructions),
 		Tools:           rreq.Tools,
 		ToolChoice:      rreq.ToolChoice,
 		Temperature:     rreq.Temperature,
-		TopP:            rreq.TopP,
 		MaxOutputTokens: responsesMaxOutputTokensEcho(rreq.MaxOutputTokens),
 		// 入站该字段不解析（在安全丢弃清单里），恒按库默认值回显
 		ParallelToolCalls: false,

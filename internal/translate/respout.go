@@ -49,12 +49,17 @@ const (
 //
 // Tools/ToolChoice 必须是客户端原始声明（Responses 扁平形状），
 // 绝不能回显归一化后的 Anthropic 形状，否则严格客户端解析回显对象时失败。
+//
+// 刻意**不**回显 top_p（故此处没有该字段）：入站会把它存进规范请求，
+// 但 BuildCcRequest（三条入站共用）只转发 temperature，top_p 从未到达上游——
+// 回显一个从未生效的参数等于向客户端谎报「已生效」，而谎报正是这里真正的缺陷。
+// 因此按 2026-09-21 拍板：静默丢弃，且**不留痕**（top_p 几乎无人使用，
+// 不为它引入 warn；这是「所有丢弃必须留痕」规约的显式例外，见 AGENTS.md §三.6 丢弃清单）。
 type ResponsesEcho struct {
 	Instructions      string
 	Tools             []types.ResponsesTool
 	ToolChoice        json.RawMessage
 	Temperature       *float64
-	TopP              *float64
 	MaxOutputTokens   *int
 	ParallelToolCalls bool
 }
@@ -391,11 +396,9 @@ func (o *responsesOut) closeBlock() []types.StreamEvent {
 		return o.closeTextPart()
 
 	case types.ResponsesItemReasoning:
-		text := open.thinking.String()
-		var out []types.StreamEvent
-		out = append(out, types.NewResponsesReasoningSummaryTextDone(o.nextSeq(), open.index, 0, "", text))
-		out = append(out, types.NewResponsesReasoningSummaryPartDone(o.nextSeq(), open.index, 0, "", text))
-		return append(out, o.closeOpen()...)
+		// 摘要 part 的收尾与「强制收尾」复用同一段实现（见 closeOpen），
+		// 否则 error / 断流路径会漏发 part.done，让客户端的 part 永久悬空。
+		return o.closeOpen()
 
 	case types.ResponsesItemFunctionCall:
 		out := []types.StreamEvent{types.NewResponsesFunctionCallArgumentsDone(
@@ -451,14 +454,22 @@ func (o *responsesOut) closeCustom() []types.StreamEvent {
 
 // closeOpen 关闭当前打开的 item：先补齐未收尾的 part，再发 output_item.done 并推进 output_index。
 // 无打开 item 时是空操作（幂等）。
+//
+// 收尾顺序恒为「part 先 done、item 后 done」：调用方不只是 content_block_stop，
+// 还包括 error / 断流等强制收尾路径（fail → finish → closeOpen）。
+// 只在 content_block_stop 那一侧发 part.done 会让强制收尾的 part 悬空——
+// 严格客户端（Codex）收到 part.added 后会一直等 part.done，等到流结束也等不到。
 func (o *responsesOut) closeOpen() []types.StreamEvent {
 	if o.open == nil {
 		return nil
 	}
 	open := o.open
 	var out []types.StreamEvent
-	if open.kind == types.ResponsesItemMessage {
+	switch open.kind {
+	case types.ResponsesItemMessage:
 		out = append(out, o.closeTextPart()...)
+	case types.ResponsesItemReasoning:
+		out = append(out, o.closeReasoningSummary()...)
 	}
 	item := open.doneItem()
 	out = append(out, types.NewResponsesOutputItemDone(o.nextSeq(), open.index, item))
@@ -466,6 +477,18 @@ func (o *responsesOut) closeOpen() []types.StreamEvent {
 	o.outputIndex++
 	o.open = nil
 	return out
+}
+
+// closeReasoningSummary 收尾 reasoning item 的摘要 part：先 summary_text.done（带全文）、
+// 再 reasoning_summary_part.done。reasoning 的 part 在 item 宣告时无条件打开，
+// 因此这里无条件收尾，无需（也没有）partOpen 标志。
+func (o *responsesOut) closeReasoningSummary() []types.StreamEvent {
+	open := o.open
+	text := open.thinking.String()
+	return []types.StreamEvent{
+		types.NewResponsesReasoningSummaryTextDone(o.nextSeq(), open.index, 0, "", text),
+		types.NewResponsesReasoningSummaryPartDone(o.nextSeq(), open.index, 0, "", text),
+	}
 }
 
 // doneItem 把打开的 item 收敛成终态形状（status=completed）。
@@ -609,7 +632,6 @@ func (o *responsesOut) response(status string) types.ResponsesResponse {
 		Tools:             o.echo.Tools,
 		ToolChoice:        o.echo.ToolChoice,
 		Temperature:       o.echo.Temperature,
-		TopP:              o.echo.TopP,
 		MaxOutputTokens:   o.echo.MaxOutputTokens,
 		ParallelToolCalls: o.echo.ParallelToolCalls,
 	}

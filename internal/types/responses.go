@@ -24,7 +24,7 @@ type ResponsesRequest struct {
 	MaxOutputTokens    int                 `json:"max_output_tokens,omitempty"`
 	Stream             bool                `json:"stream,omitempty"`
 	Temperature        *float64            `json:"temperature,omitempty"`
-	TopP               *float64            `json:"top_p,omitempty"`
+	TopP               *float64            `json:"top_p,omitempty"` // 有意静默丢弃：不转发、不回显、不留痕，理由见 AGENTS.md §三.6
 	Tools              []ResponsesTool     `json:"tools,omitempty"`
 	ToolChoice         json.RawMessage     `json:"tool_choice,omitempty"` // string | object
 	Reasoning          *ResponsesReasoning `json:"reasoning,omitempty"`
@@ -388,8 +388,12 @@ type ResponsesError struct {
 //
 // 顶层字段存在性是硬约束（id/object/created_at/status/output/usage 恒在），
 // 另有请求回显字段供 Codex 的浅校验：model、instructions（有才输出）、
-// tools、tool_choice、temperature、top_p、max_output_tokens、parallel_tool_calls，
+// tools、tool_choice、temperature、max_output_tokens、parallel_tool_calls，
 // 以及恒定值 previous_response_id:null 与 store:false（本代理不保存任何服务端状态）。
+//
+// top_p 刻意不在回显字段里（键也不出现）：它从未被转发给上游（BuildCcRequest 只转发
+// temperature），回显它等于谎报参数已生效——真缺陷是谎报而非丢弃（见 translate/respout.go
+// 的 ResponsesEcho 注释与 AGENTS.md §三.6 的丢弃清单）。
 type ResponsesResponse struct {
 	ID                string
 	Model             string
@@ -407,7 +411,6 @@ type ResponsesResponse struct {
 	Tools             []ResponsesTool
 	ToolChoice        json.RawMessage // 原始 tool_choice：string | object
 	Temperature       *float64
-	TopP              *float64
 	MaxOutputTokens   *int
 	ParallelToolCalls bool
 }
@@ -432,7 +435,6 @@ func (r ResponsesResponse) Wire() map[string]any {
 		"tool_choice":          r.toolChoiceWire(),
 		"tools":                responsesToolsWire(r.Tools),
 		"temperature":          r.Temperature, // 指针：nil 序列化为 null（保留键）
-		"top_p":                r.TopP,
 		"max_output_tokens":    r.MaxOutputTokens,
 		"previous_response_id": nil,   // 无服务端状态，恒 null
 		"store":                false, // 无服务端状态，恒 false
@@ -731,31 +733,23 @@ func responsesToolsWire(tools []ResponsesTool) []ResponsesTool {
 	return tools
 }
 
-// responsesToolSearchArguments 保证 tool_search_call 的 arguments 在线上恒为对象：
-// 调用方可能只拿到上游的 JSON 字符串，这里统一收敛，解析失败按空对象兜底。
+// responsesToolSearchArguments 保证 tool_search_call 的 arguments 在线上恒为对象。
+//
+// 可达输入只有两种：item 宣告阶段的字面 nil，与收尾阶段由 respout 解析好的 map[string]any。
+// 参数原文的 JSON 解析一律在入站/出站侧完成（见 translate/respout.go 的 toolSearchArguments），
+// 因此这里不再保留 string / RawMessage / []byte 那类分支——它们没有调用点，
+// 只会被测试固定成「看似可达」的死代码。
 func responsesToolSearchArguments(v any) any {
-	switch t := v.(type) {
-	case nil:
-		return map[string]any{}
-	case map[string]any:
-		return t
-	case json.RawMessage:
-		return responsesParseObject(string(t))
-	case []byte:
-		return responsesParseObject(string(t))
-	case string:
-		return responsesParseObject(t)
-	default:
-		return v
+	if m, ok := v.(map[string]any); ok && len(m) > 0 {
+		return m
 	}
-}
-
-func responsesParseObject(s string) map[string]any {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(s), &m); err != nil || m == nil {
-		return map[string]any{}
-	}
-	return m
+	// 其余输入一律收敛为空对象，包括：
+	//   - typed-nil map：参数原文恰为 "null" 时 json.Unmarshal 既不报错也不填 map，
+	//     留下的是 typed-nil map——若原样下发，线上会变成 arguments:null，
+	//     而 codex 物化该调用时要求 arguments 是对象（非对象会让它拿到坏参数）；
+	//   - 字面 nil、空 map，以及任何未来新增的非预期类型：arguments 恒为对象是硬约束，
+	//     宁缺勿坏形状。
+	return map[string]any{}
 }
 
 // responsesItemStatus item 的 status 键恒存在：调用方漏设时按 added 阶段语义回退

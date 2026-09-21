@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/B1anYu/cmdc2api/internal/config"
 	"github.com/B1anYu/cmdc2api/internal/masq"
+	"github.com/B1anYu/cmdc2api/internal/translate"
+	"github.com/B1anYu/cmdc2api/internal/types"
 )
 
 // newFakeCC 模拟 cmdc 上游：记录收到的请求，按脚本回 NDJSON。
@@ -530,8 +533,56 @@ func TestEndToEnd_NotFoundShapeByPath(t *testing.T) {
 	}
 }
 
-// ---------- 鉴权：不校验 key 形态（F26） ----------
+// F16：OpenAI 形状错误只有一份实现（translate.OpenAIErrorBody）。两条出口——开流前的
+// JSON 错误响应（openaiErrors.Write，保留可重试状态码与 Retry-After 头）与流内错误帧
+// （编码器，HTTP 状态码已发出只能换形状）——对同一 (type, message) 必须给出逐字段相同的
+// 错误对象：客户端按 type/code 分流重试，形状一旦随「错误发生的时点」漂移就会分流错。
+func TestOpenAIErrorShapeConvergedAcrossExits(t *testing.T) {
+	for _, errType := range []string{
+		"authentication_error", "invalid_request_error", "rate_limit_error",
+		"not_found_error", "api_error", "overloaded_error",
+	} {
+		t.Run(errType, func(t *testing.T) {
+			// 出口一：开流前 JSON 错误响应（状态码与 Retry-After 原样保留）
+			rec := httptest.NewRecorder()
+			openaiErrors{}.Write(rec, http.StatusBadGateway, errType, "boom", 7)
+			if rec.Code != http.StatusBadGateway {
+				t.Errorf("status = %d, want 502（只换形状不换码位）", rec.Code)
+			}
+			if got := rec.Header().Get("Retry-After"); got != "7" {
+				t.Errorf("Retry-After = %q, want 7", got)
+			}
+			jsonBody := decodeJSON(t, rec.Body.String())
+			if _, hasType := jsonBody["type"]; hasType {
+				t.Errorf("OpenAI 形状不得带顶层 type: %v", jsonBody)
+			}
+			jsonErr := mMap(t, jsonBody, "error")
+			if want := translate.OpenAIErrorBody(errType, "boom"); !reflect.DeepEqual(jsonErr, want) {
+				t.Errorf("JSON 出口 error = %v, want 共享实现 %v", jsonErr, want)
+			}
 
+			// 出口二：流内错误帧（首帧前的错误不产帧，故先喂一条文本增量开流）
+			enc := translate.NewChatEncoder("test-model", "chatcmpl-test")
+			enc.Feed(types.StreamEvent{Data: types.ContentBlockDeltaEvent{
+				Index: 0, Delta: types.TextDelta{Type: "text_delta", Text: "x"},
+			}})
+			frames := enc.Feed(types.NewErrorEvent(errType, "boom"))
+			if len(frames) != 1 {
+				t.Fatalf("error frames = %d, want 1", len(frames))
+			}
+			payloads := chatDataLines(t, string(frames[0]))
+			if len(payloads) != 1 {
+				t.Fatalf("error frame payloads = %v, want 1", payloads)
+			}
+			streamErr := mMap(t, decodeJSON(t, payloads[0]), "error")
+			if !reflect.DeepEqual(streamErr, jsonErr) {
+				t.Errorf("两条出口形状漂移：stream = %v, json = %v", streamErr, jsonErr)
+			}
+		})
+	}
+}
+
+// ---------- 鉴权：不校验 key 形态（F26） ----------
 // assertAnthropicError 断言 Anthropic 形状错误体：顶层 "type":"error" + error.{type,message}。
 // OpenAI 形状无顶层 type（判定依据见 TestEndToEnd_NotFoundShapeByPath）。
 func assertAnthropicError(t *testing.T, body map[string]any, wantType, wantMsgSub string) {

@@ -2,6 +2,7 @@ package translate
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -392,6 +393,42 @@ func TestChatEncoder_ErrorBeforeContent(t *testing.T) {
 	}
 }
 
+// 流内错误帧必须直接用共享的 OpenAIErrorBody（F16：OpenAI 错误形状表全仓仅一份）。
+// 六个映射档各钉一条；server 侧开流前 JSON 出口对同一 (type,message) 的形状一致性
+// 由 server_test 的 TestOpenAIErrorShapeConvergedAcrossExits 交叉钉住。
+func TestChatEncoder_ErrorFramesUseSharedErrorBody(t *testing.T) {
+	for _, errType := range []string{
+		"authentication_error", "invalid_request_error", "rate_limit_error",
+		"not_found_error", "api_error", "overloaded_error",
+	} {
+		t.Run(errType, func(t *testing.T) {
+			enc := NewChatEncoder("test-model", "chatcmpl-abc")
+			// 先喂一条文本增量开流：首帧前的错误不产帧（见 TestChatEncoder_ErrorBeforeContent）
+			open := types.StreamEvent{Data: types.ContentBlockDeltaEvent{
+				Index: 0, Delta: types.TextDelta{Type: "text_delta", Text: "x"},
+			}}
+			if frames := enc.Feed(open); len(frames) != 2 { // role 声明 + 文本
+				t.Fatalf("opening frames = %d, want 2", len(frames))
+			}
+			frames := enc.Feed(types.NewErrorEvent(errType, "boom"))
+			if len(frames) != 1 {
+				t.Fatalf("error frames = %d, want 1", len(frames))
+			}
+			obj, done := parseFrame(t, frames[0])
+			if done {
+				t.Fatal("[DONE] must not follow an in-stream error")
+			}
+			errObj, ok := obj["error"].(map[string]any)
+			if !ok {
+				t.Fatalf("frame = %v, want an error frame", obj)
+			}
+			if want := OpenAIErrorBody(errType, "boom"); !reflect.DeepEqual(errObj, want) {
+				t.Errorf("error frame = %v, want shared body %v", errObj, want)
+			}
+		})
+	}
+}
+
 // Finish 幂等；没有 message_stop 的截断流也要收尾。
 func TestChatEncoder_FinishContract(t *testing.T) {
 	t.Run("idempotent", func(t *testing.T) {
@@ -463,6 +500,52 @@ func feedAggregator(agg *ChatAggregator, lines ...string) {
 	}
 }
 
+// 非流式聚合的**生产**事件序（走真实 translator）：两个工具调用。
+// 块的开启与参数增量是严格交错的（start(0) → delta(0) → start(1) → delta(1)），
+// 第二次 append 必然在首次写入之后扩容——这正是按值存放 Builder 的踩雷路径
+// （本例在修复前会 panic：strings: illegal use of non-zero Builder copied by value）。
+func TestChatAggregator_ParallelToolCalls(t *testing.T) {
+	agg := NewChatAggregator("test-model", "chatcmpl-abc")
+	feedAggregator(agg,
+		`{"type":"tool-call","toolCallId":"call_a","toolName":"read","input":{"path":"a.go","n":2}}`,
+		`{"type":"tool-call","toolCallId":"call_b","toolName":"write","input":{"body":"x"}}`,
+		`{"type":"finish","finishReason":"tool-calls","totalUsage":{"inputTokens":10,"outputTokens":5}}`,
+	)
+	msg := agg.Completion().Choices[0].Message
+	if len(msg.ToolCalls) != 2 {
+		t.Fatalf("tool_calls = %+v, want 2", msg.ToolCalls)
+	}
+	want := []struct{ id, name, args string }{
+		{"call_a", "read", `{"n":2,"path":"a.go"}`},
+		{"call_b", "write", `{"body":"x"}`},
+	}
+	for i, w := range want {
+		got := msg.ToolCalls[i]
+		if got.ID != w.id || got.Function.Name != w.name {
+			t.Errorf("tool %d = %+v, want %s/%s", i, got, w.id, w.name)
+		}
+		// 参数是 JSON，键序由上游输入决定（map 序列化按键排序）；此处只比对语义
+		if !chatAggArgsEqual(t, got.Function.Arguments, w.args) {
+			t.Errorf("tool %d arguments = %q, want %q", i, got.Function.Arguments, w.args)
+		}
+	}
+}
+
+// chatAggArgsEqual 比较两段 JSON 的语义（忽略对象键序）。
+func chatAggArgsEqual(t *testing.T, a, b string) bool {
+	t.Helper()
+	var av, bv any
+	if err := json.Unmarshal([]byte(a), &av); err != nil {
+		t.Errorf("invalid JSON %q: %v", a, err)
+		return false
+	}
+	if err := json.Unmarshal([]byte(b), &bv); err != nil {
+		t.Errorf("invalid JSON %q: %v", b, err)
+		return false
+	}
+	return reflect.DeepEqual(av, bv)
+}
+
 func TestChatAggregator_MessageShape(t *testing.T) {
 	agg := NewChatAggregator("test-model", "chatcmpl-abc")
 	feedAggregator(agg,
@@ -524,6 +607,83 @@ func TestChatAggregator_ToolCallOnly(t *testing.T) {
 	}
 	if len(msg.ToolCalls) != 1 || msg.ToolCalls[0].Function.Arguments != `{}` {
 		t.Errorf("empty arguments must become {}: %+v", msg.ToolCalls)
+	}
+}
+
+// 同一工具块收到多条 InputJSONDelta 时参数必须逐字拼接、不能丢（F20）。
+// 手工构造 StreamEvent 序列是刻意的：当前 translator 每个 tool 块只发一条
+// input_json_delta，走真实链路反而覆盖不到「分片发参」这一上游可能的变化；
+// 本用例绕过该偶然限制，直接钉住聚合器自身的拼接行为。
+// 第二个子场景在两条 delta 之间插入新的工具块开启事件，强制 append 扩容发生在
+// 「已写入的 Builder 之后」——正是按值存放 strings.Builder 的踩雷路径
+// （扩容复制 Builder，被复制的 Builder 再被写入/读取即触发 copyCheck 恐慌）。
+func TestChatAggregator_MultiDeltaToolArgs(t *testing.T) {
+	start := func(idx int, id, name string) types.StreamEvent {
+		return types.StreamEvent{Data: types.ContentBlockStartEvent{
+			Index: idx,
+			ContentBlock: types.ToolUseBlockStart{
+				Type: "tool_use", ID: id, Name: name, Input: map[string]any{},
+			},
+		}}
+	}
+	delta := func(idx int, frag string) types.StreamEvent {
+		return types.StreamEvent{Data: types.ContentBlockDeltaEvent{
+			Index: idx, Delta: types.InputJSONDelta{Type: "input_json_delta", PartialJSON: frag},
+		}}
+	}
+
+	cases := []struct {
+		name  string
+		evs   []types.StreamEvent
+		wants []string // 按工具序号排列的完整 arguments
+	}{
+		{
+			name: "同一块多条 delta",
+			evs: []types.StreamEvent{
+				start(0, "call_a", "read"),
+				delta(0, `{"path":`),
+				delta(0, `"a.go"`),
+				delta(0, `,"n":2}`),
+			},
+			wants: []string{`{"path":"a.go","n":2}`},
+		},
+		{
+			// 扩容后再写首块：按值存放会在这一步把 Builder 复制出去
+			name: "跨块交错 + 中途扩容",
+			evs: []types.StreamEvent{
+				start(0, "call_a", "read"),
+				delta(0, `{"path":`),
+				start(1, "call_b", "write"), // 触发切片扩容
+				delta(1, `{"body":`),
+				delta(0, `"a.go"`),
+				delta(1, `"x"`),
+				start(2, "call_c", "list"), // 再次扩容
+				delta(0, `,"n":2}`),
+				delta(1, `}`),
+			},
+			wants: []string{`{"path":"a.go","n":2}`, `{"body":"x"}`, `{}`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agg := NewChatAggregator("test-model", "chatcmpl-abc")
+			for _, ev := range tc.evs {
+				agg.Feed(ev)
+			}
+			calls := agg.Completion().Choices[0].Message.ToolCalls
+			if len(calls) != len(tc.wants) {
+				t.Fatalf("tool_calls = %d, want %d: %+v", len(calls), len(tc.wants), calls)
+			}
+			for i, want := range tc.wants {
+				if got := calls[i].Function.Arguments; got != want {
+					t.Errorf("tool %d arguments = %q, want %q", i, got, want)
+				}
+				if !json.Valid([]byte(calls[i].Function.Arguments)) {
+					t.Errorf("tool %d arguments = %q: not valid JSON", i, calls[i].Function.Arguments)
+				}
+			}
+		})
 	}
 }
 
@@ -589,6 +749,43 @@ func TestChatOut_StreamMatchesAggregate(t *testing.T) {
 	}
 	if usage["prompt_tokens"] != float64(want.Usage.PromptTokens) || usage["completion_tokens"] != float64(want.Usage.CompletionTokens) {
 		t.Errorf("stream usage = %v, aggregate = %+v", usage, want.Usage)
+	}
+}
+
+// F16：usage 换算只有一份实现（chatUsageFrom），流式 usage 帧与非流式 Usage 必须
+// 逐字段相同——含容易漏掉的 cache_creation 分支（cacheWriteTokens > 0 时并入总输入）。
+func TestChatOut_UsageConvergedAcrossForms(t *testing.T) {
+	lines := []string{
+		`{"type":"text-delta","text":"hi"}`,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":10,"outputTokens":5,"cachedInputTokens":4,"inputTokenDetails":{"noCacheTokens":6,"cacheReadTokens":4,"cacheWriteTokens":3}}}`,
+	}
+
+	agg := NewChatAggregator("test-model", "chatcmpl-abc")
+	feedAggregator(agg, lines...)
+	want := agg.Completion().Usage
+
+	enc := NewChatEncoder("test-model", "chatcmpl-abc")
+	frames, _ := framesFrom(t, enc, lines...)
+	var usage map[string]any
+	for _, f := range frames {
+		if u, ok := f["usage"].(map[string]any); ok {
+			usage = u
+		}
+	}
+	if usage == nil {
+		t.Fatal("stream frames carry no usage chunk")
+	}
+
+	// 6(非缓存) + 4(缓存读取) + 3(缓存写入) = 13，写死期望值以防两条路径一起算错
+	if want.PromptTokens != 13 || want.CompletionTokens != 5 || want.TotalTokens != 18 {
+		t.Fatalf("aggregate usage = %+v, want prompt 13 / completion 5 / total 18", want)
+	}
+	details, _ := usage["prompt_tokens_details"].(map[string]any)
+	if usage["prompt_tokens"] != float64(want.PromptTokens) ||
+		usage["completion_tokens"] != float64(want.CompletionTokens) ||
+		usage["total_tokens"] != float64(want.TotalTokens) ||
+		details["cached_tokens"] != float64(want.PromptTokensDetails.CachedTokens) {
+		t.Errorf("stream usage = %v, aggregate = %+v: 两形态必须同源", usage, want)
 	}
 }
 

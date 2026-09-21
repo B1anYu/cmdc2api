@@ -1170,8 +1170,10 @@ func TestResponses_UpstreamEnvelope(t *testing.T) {
 	if got := mNum(t, respBody, "temperature"); got != 0.3 {
 		t.Errorf("echo temperature = %v", got)
 	}
-	if got := mNum(t, respBody, "top_p"); got != 0.9 {
-		t.Errorf("echo top_p = %v", got)
+	// top_p 不在回显字段里（请求体里发了 0.9，响应里连键都不该出现）：
+	// 它从未被转发给上游，回显等于谎报参数已生效（#14）
+	if v, ok := respBody["top_p"]; ok {
+		t.Errorf("响应不应回显 top_p（该参数从未到达上游）: %v", v)
 	}
 	if got := mNum(t, respBody, "max_output_tokens"); got != 111 {
 		t.Errorf("echo max_output_tokens = %v", got)
@@ -1500,6 +1502,40 @@ func TestResponses_IgnoredFieldsAreLogged(t *testing.T) {
 }
 
 // ---------- 终态事件的回显与流式形状 ----------
+
+// TestResponses_TopPDroppedSilently top_p 是「所有丢弃必须留痕」规约的**显式例外**
+// （用户 2026-09-21 拍板：静默丢弃，不引入 warn）：它从未被转发给上游
+// （BuildCcRequest 三条路径共用，只转发 temperature），此前却在响应里被回显，
+// 让客户端误以为参数生效了——谎报才是真缺陷。
+//
+// 本用例刻意与项目默认规约相反，同时钉住两件事：
+//  1. 响应体（流式终态事件与非流式响应体）里连 top_p 键都不出现；
+//  2. 这次丢弃不产生任何日志（WARN / INFO 都不允许），否则等于偷偷加了留痕。
+func TestResponses_TopPDroppedSilently(t *testing.T) {
+	rec := &levelRecorder{}
+	old := slog.Default()
+	slog.SetDefault(slog.New(rec))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	_, proxy := responsesProxy(t, defaultScript(), nil)
+
+	// 非流式：JSON 响应体
+	body := readAll(t, postResponses(t, proxy, responsesBody(false, `"top_p":0.9,`), responsesAuth))
+	if v, ok := decodeJSON(t, body)["top_p"]; ok {
+		t.Errorf("非流式响应不应回显 top_p（该参数从未到达上游）: %v", v)
+	}
+
+	// 流式：终态事件的 response 与非流式共用同一个 Wire()
+	sse := readAll(t, postResponses(t, proxy, responsesBody(true, `"top_p":0.9,`), responsesAuth))
+	final := respTerminalResponse(t, respFrames(t, sse))
+	if v, ok := final["top_p"]; ok {
+		t.Errorf("流式终态不应回显 top_p（该参数从未到达上游）: %v", v)
+	}
+
+	if logs := rec.all(); strings.Contains(strings.ToLower(logs), "top_p") {
+		t.Errorf("top_p 的丢弃是有意静默的，不允许产生任何留痕:\n%s", logs)
+	}
+}
 
 // TestResponses_StreamTerminalCarriesEcho 终态事件必须带完整 output、usage 与请求回显字段：
 // Codex 的 get_final_response() 直接解析终态事件，且对响应对象做浅校验。

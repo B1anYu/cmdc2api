@@ -31,6 +31,8 @@ const scannerMaxLine = 64 << 20
 // 帧必须自带完整的 "event: ...\ndata: ...\n\n" 形状：管线只做缓冲与写出，
 // 不感知也不解析帧内容。返回 [][]byte 而非类型化事件，正是为了容纳
 // 一条上游事件展开成多帧（Responses 的 item 生命周期）或零帧（Chat 的忽略事件）的协议。
+//
+// 有状态（已发首帧/收尾/序号/usage 等请求级状态），每个请求都要新建。
 type EventEncoder interface {
 	Feed(ev types.StreamEvent) [][]byte
 	Finish() [][]byte
@@ -81,11 +83,11 @@ func (anthropicErrors) Write(w http.ResponseWriter, status int, errType, message
 }
 
 // openaiErrors OpenAI 形状错误出口，/v1/responses 与 /v1/chat/completions 共用。
-// 状态码原样保留（只换形状不换码位），但错误类型走 openaiErrorShape 的映射表。
+// 状态码原样保留（只换形状不换码位），错误体走 translate.OpenAIErrorBody 的**唯一**实现
+// （错误形状表只此一份，流内错误帧与本地错误响应因此不可能形状漂移）。
 type openaiErrors struct{}
 
 func (openaiErrors) Write(w http.ResponseWriter, status int, errType, message string, retryAfter int) {
-	typ, code := openaiErrorShape(errType)
 	w.Header().Set("Content-Type", "application/json")
 	if retryAfter > 0 {
 		w.Header().Set("Retry-After", itoa(retryAfter))
@@ -93,33 +95,7 @@ func (openaiErrors) Write(w http.ResponseWriter, status int, errType, message st
 	w.WriteHeader(status)
 	// param 恒为 null：OpenAI SDK 按字段存在性解析，缺字段比 null 更容易触发解码告警。
 	// retry_after 不进 JSON 体（OpenAI 形状无此字段），只走 Retry-After 头。
-	_ = writeJSON(w, map[string]any{
-		"error": map[string]any{
-			"message": message,
-			"type":    typ,
-			"param":   nil,
-			"code":    code,
-		},
-	})
-}
-
-// openaiErrorShape Anthropic 错误类型 → OpenAI (type, code)。
-// type 决定客户端的重试分流，code 供程序化判定（如 invalid_api_key 触发换 key），
-// 两者都要给，不能只给其一。
-func openaiErrorShape(errType string) (typ, code string) {
-	switch errType {
-	case "authentication_error":
-		return "invalid_request_error", "invalid_api_key"
-	case "invalid_request_error":
-		return "invalid_request_error", "invalid_request_error"
-	case "rate_limit_error":
-		return "rate_limit_error", "rate_limit_exceeded"
-	case "not_found_error":
-		return "not_found_error", "not_found_error"
-	default:
-		// api_error / overloaded_error 等：OpenAI 形状没有对应类型，统归 server_error
-		return "server_error", "server_error"
-	}
+	_ = writeJSON(w, map[string]any{"error": translate.OpenAIErrorBody(errType, message)})
 }
 
 // ---------- 共享上游管线 ----------
@@ -133,9 +109,9 @@ type PipelineRequest struct {
 	Header http.Header    // 客户端原始请求头：会话亲和解析与伪装透传共用
 	// Stream 出站形态（客户端是否要求流式）：同时决定空闲超时档位与出站分支
 	Stream     bool
-	Encoder    EventEncoder    // Stream=true 时使用；无状态可复用
+	Encoder    EventEncoder    // Stream=true 时使用；有状态，每请求新建
 	Aggregator EventAggregator // Stream=false 时使用；有状态，每请求新建
-	Errors     ErrorWriter     // 错误出口形状
+	Errors     ErrorWriter     // 错误出口形状（无状态，可复用）
 }
 
 // runPipeline 归一化完成后的共享上游管线：
