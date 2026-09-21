@@ -37,7 +37,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 必须走「带原始报文」的版本：include/text/parallel_tool_calls 这类无上游能力的字段
+	// 必须走「带原始报文」的版本：include/text 这类无上游能力的字段
 	// 在 ResponsesRequest 里没有类型，只有原始报文能证明客户端确实发过它们（§0.4 留痕硬约束）。
 	areq, mapping, warns, err := translate.ResponsesToRequestBody(body, &rreq)
 	if err != nil {
@@ -75,8 +75,10 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		ToolChoice:      rreq.ToolChoice,
 		Temperature:     rreq.Temperature,
 		MaxOutputTokens: responsesMaxOutputTokensEcho(rreq.MaxOutputTokens),
-		// 入站该字段不解析（在安全丢弃清单里），恒按库默认值回显
-		ParallelToolCalls: false,
+		// parallel_tool_calls 回显客户端的真实声明：未声明 → 协议默认 true
+		// （上游默认即允许并行，与本代理「任由上游并行」的实际行为一致）；显式 false
+		// 已被映射为上游的 tool_choice.disable_parallel_tool_use，故回显 false。
+		ParallelToolCalls: rreq.ParallelToolCalls == nil || *rreq.ParallelToolCalls,
 	}
 
 	// 编码器与聚合器都持有请求级状态（item 生命周期、sequence_number、usage），必须每请求新建；

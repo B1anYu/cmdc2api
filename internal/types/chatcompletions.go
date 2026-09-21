@@ -145,9 +145,54 @@ type ChatToolCall struct {
 //
 // Arguments 刻意不带 omitempty：工具调用首帧必须显式给出 arguments:""，
 // 客户端按该键的存在性判断「参数从这里开始累积」，缺键会丢掉首帧语义。
+//
+// 入站解析宽容（见 UnmarshalJSON 与 chatFunctionArguments）：Arguments 在协议里是
+// 「JSON 文本的字符串」，但客户端把 arguments 直接写成对象/数组/数字都是合法 JSON，
+// 不能让一条 tool_call 把整轮请求打成 400。
 type ChatFunctionCall struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
+}
+
+// UnmarshalJSON 只放宽 Arguments 的形态，其余保持严格：
+// 整个 function 对象解析失败（如 function 是数字）时照样返回 error，
+// 调用方（server/chat.go）仍按原语义回 400。
+func (c *ChatFunctionCall) UnmarshalJSON(raw []byte) error {
+	var wire struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return err
+	}
+	c.Name = wire.Name
+	c.Arguments = chatFunctionArguments(wire.Arguments)
+	return nil
+}
+
+// chatFunctionArguments 把 function.arguments 的任意 JSON 形态归一到「参数字符串」。
+//
+// 背景：本字段此前是裸 string，客户端发对象/数组/数字（都是合法 JSON）会让整个请求体
+// json.Unmarshal 失败 → handler 回 400，一条 tool_call 拖垮整轮对话。
+//
+// 口径（全程容忍，依据 A 级参照 reference/commandcode-proxy/proxy.mjs：
+// :450 对非字符串 arguments 原样透传、:542-544 与 :1256 的 tryParseJSON 失败回 {}）：
+//   - 字符串 → 原样（OpenAI 协议的正规形态，去掉 JSON 引号与转义即得参数字符串）；
+//   - null 或缺失 → ""（空参数调用）；
+//   - 其它合法 JSON（对象 / 数组 / 数字 / 布尔）→ 原始 JSON 文本。因为本字段类型是字符串，
+//     这就是参照的「原样透传」：下游（translate 的 chatToolArgs）会按 JSON 解析它，
+//     于是对象形态正好还原成合法的 object input，信息一点不丢。
+//
+// 这里刻意不留痕：这是形态换算而非丢弃（无信息损失），与「所有丢弃必须留痕」的规约不冲突。
+func chatFunctionArguments(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	return string(raw)
 }
 
 // ---------- 出站 Chat Completions 响应与流式分片 ----------

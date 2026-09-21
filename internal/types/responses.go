@@ -33,13 +33,17 @@ type ResponsesRequest struct {
 	// PromptCacheKey 被**消费**（作为会话亲和的候选键，见 types.Request.PromptCacheKey），
 	// 故不再列在 responsesIgnoredFields 里——它既不是丢弃项，也就不该报「ignored」。
 	PromptCacheKey *string `json:"prompt_cache_key,omitempty"`
+	// ParallelToolCalls 同样被**消费**：false 映射为上游 tool_choice 侧的同名开关
+	// （disable_parallel_tool_use，与 Chat 侧同一实现），故不再列在 responsesIgnoredFields 里。
+	// 未声明与 true 一律不动；回显由 server/responses.go 按真实值给出（未声明 = 协议默认 true）。
+	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
 }
 
 // responsesIgnoredFields 声明「客户端会发、但上游无对应能力」的字段。
 // 顺序固定，保证同一请求的 warns 输出可复现。
 var responsesIgnoredFields = []string{
 	"include", "truncation", "background", "service_tier",
-	"safety_identifier", "user", "metadata", "text", "parallel_tool_calls",
+	"safety_identifier", "user", "metadata", "text",
 	"top_logprobs", "stream_options",
 }
 

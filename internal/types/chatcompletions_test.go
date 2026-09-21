@@ -282,3 +282,69 @@ func TestChatImageURL_BothShapes(t *testing.T) {
 		}
 	}
 }
+
+// F8：function.arguments 的六种入站形态都要归一到「参数字符串」。
+// 此前 Arguments 是裸 string，客户端发对象/数组/数字（都是合法 JSON）会让整个请求体
+// json.Unmarshal 失败 → handler 回 400，一条 tool_call 拖垮整轮对话。
+// 取值口径见 chatFunctionArguments（字符串原样 / null 与缺失 → "" / 其它合法 JSON → 原始文本）。
+func TestChatFunctionCall_ArgumentsShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		body string // function 对象原文
+		want string
+	}{
+		{"string", `{"name":"f","arguments":"{\"a\":1}"}`, `{"a":1}`},
+		{"object", `{"name":"f","arguments":{"city": "SF"}}`, `{"city": "SF"}`},
+		{"array", `{"name":"f","arguments":[1,2]}`, `[1,2]`},
+		{"number", `{"name":"f","arguments":42}`, `42`},
+		{"bool", `{"name":"f","arguments":true}`, `true`},
+		{"null", `{"name":"f","arguments":null}`, ``},
+		{"absent", `{"name":"f"}`, ``},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var fc ChatFunctionCall
+			if err := json.Unmarshal([]byte(tc.body), &fc); err != nil {
+				t.Fatalf("unmarshal %s: %v", tc.body, err)
+			}
+			if fc.Arguments != tc.want {
+				t.Errorf("Arguments = %q, want %q", fc.Arguments, tc.want)
+			}
+			if fc.Name != "f" {
+				t.Errorf("Name = %q, want f（放宽 Arguments 不得影响同对象的其它字段）", fc.Name)
+			}
+		})
+	}
+}
+
+// F8 根因断言：真实 SDK 回放形态（arguments 是对象）的**完整 Chat 请求**必须能解析。
+// 同时钉住反方向——整个 function 对象解析失败时仍要报错（既有 400 语义不变）。
+func TestChatRequest_ObjectArgumentsParses(t *testing.T) {
+	raw := `{
+		"model": "m",
+		"messages": [
+			{"role": "user", "content": "weather?"},
+			{"role": "assistant", "content": null, "tool_calls": [
+				{"id": "call_1", "type": "function",
+				 "function": {"name": "get_weather", "arguments": {"city": "SF"}}}
+			]}
+		]
+	}`
+	var req ChatRequest
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatalf("对象形态 arguments 不得让整轮请求 400: %v", err)
+	}
+	if len(req.Messages) != 2 || len(req.Messages[1].ToolCalls) != 1 {
+		t.Fatalf("messages = %+v", req.Messages)
+	}
+	fc := req.Messages[1].ToolCalls[0].Function
+	if fc.Name != "get_weather" || fc.Arguments != `{"city": "SF"}` {
+		t.Errorf("function = %+v, want name=get_weather arguments={\"city\": \"SF\"}", fc)
+	}
+
+	// function 整个不是对象（非法形态）时仍要报错：宽容只针对 arguments 的取值形态
+	if err := json.Unmarshal([]byte(`{"model":"m","messages":[{"role":"assistant",
+		"tool_calls":[{"id":"call_1","type":"function","function":123}]}]}`), &req); err == nil {
+		t.Error("function 不是对象时必须仍然报错（保持既有 400 语义）")
+	}
+}

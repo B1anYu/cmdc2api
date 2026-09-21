@@ -259,8 +259,14 @@ func chatApplyParallelToolCalls(parallel *bool, hasTools bool, toolChoice *json.
 
 // chatDroppedFieldWarnings 安全丢弃清单：这些字段上游没有对应能力，
 // 必须留痕（info: 前缀为良性，其余按警告计），否则客户端会以为限制已生效。
-// parallelApplied 表示 parallel_tool_calls 已成功并入 tool_choice（见上），
-// 此时字段并未丢失，不再留痕。
+// parallelApplied 表示 parallel_tool_calls=false 已成功并入 tool_choice（见上），
+// 此时该字段并未丢失，不再留痕。
+//
+// parallel_tool_calls 的留痕条件（与 Responses 侧 respin.go **完全一致**）：
+// **仅当客户端明确要求串行（显式 false）而我们无法表达时**才报。
+// 显式 true 与未声明都不报——true 本就是上游默认行为，没有任何限制被忽略；
+// 若对 true 也报，则「每轮都显式发 true」的客户端会每请求刷一条无信息量的
+// 日志（与「文案必须带可行动的后果、同请求内聚合」的口径冲突）。
 func chatDroppedFieldWarnings(req *types.ChatRequest, parallelApplied bool) []string {
 	var warns []string
 	// stop 是行为性丢失：客户端以为会在指定序列处截断，实际不会，必须按警告留痕。
@@ -272,7 +278,7 @@ func chatDroppedFieldWarnings(req *types.ChatRequest, parallelApplied bool) []st
 	if len(req.ResponseFormat) > 0 && string(req.ResponseFormat) != "null" {
 		warns = append(warns, "response_format ignored (upstream has no structured-output mode)")
 	}
-	if req.ParallelToolCalls != nil && !parallelApplied {
+	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls && !parallelApplied {
 		warns = append(warns, "parallel_tool_calls ignored (upstream has no per-request parallel-call toggle)")
 	}
 	if req.StreamOptions != nil {

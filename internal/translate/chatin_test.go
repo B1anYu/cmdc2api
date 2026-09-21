@@ -505,7 +505,9 @@ func TestChatToRequest_ParallelToolCalls(t *testing.T) {
 			`{"type":"tool","name":"f","disable_parallel_tool_use":true}`, false},
 		{"false-with-string-tool-choice", `"parallel_tool_calls":false,"tool_choice":"required",` + tools,
 			`{"type":"any","disable_parallel_tool_use":true}`, false},
-		{"true-with-tools", `"parallel_tool_calls":true,` + tools, "", true},
+		// 显式 true 不留痕：true 就是上游默认行为，没有任何限制被忽略（且每轮都发
+		// true 的客户端会被无信息量的 warn 刷屏）。与 Responses 侧口径一致。
+		{"true-with-tools", `"parallel_tool_calls":true,` + tools, "", false},
 		{"absent-with-tools", tools, "", false},
 	}
 	for _, tc := range cases {

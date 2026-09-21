@@ -69,7 +69,10 @@
      - 工具 `parameters` 非 object（无参数、顶层 `anyOf`/`oneOf`、`type` 缺失或非 object、非法 JSON）→ 同样整体替换为 `{"type":"object","properties":{}}` 并聚合留痕；
      - 工具参数 `arguments` 非法 JSON → 兜底 `{}` 并留痕（原始文本就此丢失）；合法 JSON 但非 object → **原样透传**并留痕（**不擅自包一层**）——**两条入站路径共用同一实现**（`chatToolArgsReport`）；
      - **未知 `role` 的 message / input item → 降级为一条 user 消息（内容保留）**，留痕记「downgraded to a user message」。依据 A 级参照 `proxy.mjs:467-468`（其注释理由是「避免 CC 校验拒绝」）。**取代此前的「整条丢弃」**；
-     - Responses 的 `tool_search_output` **仅在 `status == "completed"` 时才提升**为正式工具声明（缺 `status` 不再被当作完成态）。
+     - Responses 的 `tool_search_output` **仅在 `status == "completed"` 时才提升**为正式工具声明（缺 `status` 不再被当作完成态）；
+     - **`parallel_tool_calls` 有上游载体，不是丢弃项**：并入 `tool_choice.disable_parallel_tool_use`，经 `convertToolChoice` 落到信封**顶层 `params.parallel_tool_calls`**（`CcToolChoice` 只有 type/name，线格式里**没有**这个标志）。映射与 Chat 侧**共用** `chatApplyParallelToolCalls`，且必须在 `tool_choice` 落地**之后**合并。留痕口径两条入站一致：**仅「显式 `false` 但本轮无工具、无法表达」按行为性丢失 WARN**；显式 `true` 与未声明**不报**（`true` 就是上游默认行为，没有任何限制被忽略；对 `true` 也报会让「每轮都发 true」的客户端被无信息量的日志刷屏）。；
+     - **回显语义**：Responses 的 `parallel_tool_calls` 未声明时回显协议默认 `true`、显式值回显其原值（旧实现**恒回 `false`**、与「任由上游并行」的实际行为方向相反）；
+     - Chat 的 `function.arguments` 为**非字符串**（对象/数组/数字/布尔）时**不再让整轮 400**，按原始 JSON 文本透传（`types.chatFunctionArguments`，依据 A 级 `proxy.mjs:450/542-544/1256` 的全程容忍）；这属**形态换算、非丢弃，故不留痕**。
    - **绝不覆写**（非丢弃项，登记于此以防文档与代码互相矛盾）：客户端 part 级 `cache_control`（含 `ttl`）**原样透传**，仅当 `type` 缺失时补 `"ephemeral"`，**无 ttl 时不合成 ttl**——cmdc 之下还有它自己的上游（deepseek 等默认 24h 缓存），覆写 ttl 会真的拉低其默认缓存时长（见 `types.CacheControl` 注释）。
    - **出站 item 生命周期不变式**：任何 item 在**每条终结路径**（正常收尾、流内 error 事件、上游半截断开）上都必须**先 part done、再 item done**；`reasoning` 块同样如此（此前只有 message 文本块那半做了收尾，思考块漏了，严格客户端会看到 part 永久悬空）。`tool_search_call.arguments` 线上**恒为对象**（解析结果为 `null`/空/非预期类型时归一为 `{}`）。
    - 所有丢弃必须留痕（`info:` 前缀为良性观测，其余 warn），两条入站路径口径一致（空 tool_result 归一化为 `""`）。思考档位值域见 §三.5。
@@ -193,6 +196,7 @@ docker compose up -d                             # 容器方式（挂 ./data:/da
    - 流式 `message_start` 级事件在管线中先缓冲（延迟 200 语义），首帧前错误回退 JSON。
    - cmdc 上游 content part 的线格式是 `tool-call`/`tool-result` + `toolCallId`/`toolName`（挂在 role `"tool"` 消息上），**不是** Anthropic 的 `tool_use`/`tool_result` 命名。
    - 空 thinking 块出站只丢「空且无签名」的（带签名的必须发，客户端回放需要）；出站伪造签名沿用 `FakeThinkingSignature`，作为 Responses 的 `encrypted_content` 下发可自洽往返（入站还原为 thinking 块、发上游前过滤）。
+   - **`disable_parallel_tool_use` 的线上落点是信封顶层 `params.parallel_tool_calls`**，不在 `tool_choice` 对象里——`convertToolChoice` 把它读成 `CcToolChoice` 的**兄弟字段**写入 `CcParams`。断言该行为时看 `params.parallel_tool_calls`。
 
 ---
 

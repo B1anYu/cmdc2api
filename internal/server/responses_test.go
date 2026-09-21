@@ -1222,6 +1222,75 @@ func TestResponses_ZeroOutput(t *testing.T) {
 	})
 }
 
+// F9：parallel_tool_calls 的回显语义——必须回显客户端的**真实**声明。
+// 该字段的协议默认值是 true，本代理的实际行为也确实是「任由上游并行」，
+// 因此旧的硬编码 false 与事实相反：客户端发 true、或干脆没发，都会收回一个 false。
+// 修好后：显式 false → 真串行且回显 false；未声明 → 并行且回显 true。
+func TestResponses_ParallelToolCallsEcho(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields string // 追加到请求体的顶层字段（含结尾逗号则自带）
+		want   bool
+	}{
+		{"undeclared-echoes-protocol-default", "", true},
+		{"explicit-true", `"parallel_tool_calls":true,`, true},
+		{"explicit-false", `"parallel_tool_calls":false,`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, proxy := responsesProxy(t, defaultScript(), nil)
+			respBody := decodeJSON(t, readAll(t, postResponses(t, proxy, responsesBody(false, tc.fields), responsesAuth)))
+			got, ok := mGet(t, respBody, "parallel_tool_calls").(bool)
+			if !ok {
+				t.Fatalf("parallel_tool_calls 键必须存在（严格客户端做浅校验）: %v", respBody)
+			}
+			if got != tc.want {
+				t.Errorf("echo parallel_tool_calls = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// 流式终态事件的 response 与聚合器共用同一份 echo
+	t.Run("stream-terminal-event", func(t *testing.T) {
+		_, proxy := responsesProxy(t, defaultScript(), nil)
+		frames := respFrames(t, readAll(t, postResponses(t, proxy, responsesBody(true, ""), responsesAuth)))
+		respObj := respTerminalResponse(t, frames)
+		if got, ok := mGet(t, respObj, "parallel_tool_calls").(bool); !ok || !got {
+			t.Errorf("流式终态 parallel_tool_calls = %v, want true（未声明 → 协议默认值）",
+				mGet(t, respObj, "parallel_tool_calls"))
+		}
+	})
+
+	// 显式 false 但本轮没有工具：串行约束无处挂（tool_choice 不存在），必须按行为性丢失留痕。
+	// 这是该字段修复后**唯一**仍会留痕的情形——字段本身已被消费，不再是「无上游能力的丢弃项」。
+	t.Run("false-without-tools-warns", func(t *testing.T) {
+		rec := &levelRecorder{}
+		old := slog.Default()
+		slog.SetDefault(slog.New(rec))
+		t.Cleanup(func() { slog.SetDefault(old) })
+
+		_, proxy := responsesProxy(t, defaultScript(), nil)
+		if resp := postResponses(t, proxy, responsesBody(false, `"parallel_tool_calls":false,`), responsesAuth); resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200\nbody:\n%s", resp.StatusCode, readAll(t, resp))
+		} else {
+			_ = resp.Body.Close()
+		}
+		found := ""
+		for _, l := range strings.Split(rec.all(), "\n") {
+			if strings.Contains(l, "parallel_tool_calls ignored") {
+				found = l
+				break
+			}
+		}
+		if found == "" {
+			t.Fatalf("显式 false 且无工具时必须留痕\nlogs:\n%s", rec.all())
+		}
+		if !strings.HasPrefix(found, "WARN") {
+			t.Errorf("该留痕是行为性丢失，必须按 WARN 计（旧的 info: 前缀随字段被消费一并消失）: %q", found)
+		}
+	})
+}
+
 // ---------- 归一化落到上游信封 ----------
 
 // TestResponses_UpstreamEnvelope 断言 Responses 请求经归一化后在上游信封里的形状，
@@ -1332,8 +1401,13 @@ func TestResponses_UpstreamEnvelope(t *testing.T) {
 	if params["stream"] != true {
 		t.Error("params.stream 必须为 true（cmdc 恒流式）")
 	}
+	// parallel_tool_calls=false 不再是被丢弃字段（F9）：它经 tool_choice 侧的同名开关
+	// 落到信封顶层的 params.parallel_tool_calls（convertToolChoice 读 disable_parallel_tool_use）。
+	if got := params["parallel_tool_calls"]; got != false {
+		t.Errorf("params.parallel_tool_calls = %v, want false（客户端显式声明了 false）", got)
+	}
 	// 安全丢弃字段：上游无对应能力，绝不能下发（留痕走日志）
-	for _, key := range []string{"parallel_tool_calls", "truncation", "store", "include", "text"} {
+	for _, key := range []string{"truncation", "store", "include", "text"} {
 		if _, ok := params[key]; ok {
 			t.Errorf("被丢弃的字段 %q 不得进入上游信封", key)
 		}
@@ -1572,7 +1646,7 @@ func TestResponses_IgnoredFieldsAreLogged(t *testing.T) {
 	_, proxy := responsesProxy(t, defaultScript(), nil)
 	body := responsesBody(false,
 		`"truncation":"auto","include":["reasoning.encrypted_content"],`+
-			`"parallel_tool_calls":false,"text":{"format":{"type":"json_object"}},`)
+			`"text":{"format":{"type":"json_object"}},`)
 	if resp := postResponses(t, proxy, body, responsesAuth); resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200\nbody:\n%s", resp.StatusCode, readAll(t, resp))
 	} else {
@@ -1584,7 +1658,6 @@ func TestResponses_IgnoredFieldsAreLogged(t *testing.T) {
 		{"text.format/verbosity ignored", "WARN"},
 		{"include ignored", "INFO"},
 		{"truncation ignored", "INFO"},
-		{"parallel_tool_calls ignored", "INFO"},
 	} {
 		line := ""
 		for _, l := range strings.Split(logs, "\n") {

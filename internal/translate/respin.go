@@ -134,6 +134,17 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 	if tc := responsesToolChoice(req.ToolChoice, len(out.Tools) > 0, &s.warns); tc != nil {
 		out.ToolChoice = tc
 	}
+	// parallel_tool_calls=false 有上游载体（tool_choice.disable_parallel_tool_use），因此
+	// 必须在 tool_choice 落地**之后**再合并——与 Chat 侧同序、同实现（chatApplyParallelToolCalls），
+	// 两条入站的映射口径因此天然一致。显式为 true 或未声明一律不动（上游默认即允许并行）。
+	parallelApplied := chatApplyParallelToolCalls(req.ParallelToolCalls, len(out.Tools) > 0, &out.ToolChoice)
+	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls && !parallelApplied {
+		// 显式 false 但本轮最终没有工具：没有 tool_choice 可挂标志，串行约束无法表达。
+		// 文案与触发口径照搬 Chat 侧（chatin.go 的 chatDroppedFieldWarnings）——客户端
+		// 以为并行已关闭，实际上游只会照常并行，属于行为性丢失，按 WARN 计（无 info: 前缀）。
+		s.warns = append(s.warns,
+			"parallel_tool_calls ignored (upstream has no per-request parallel-call toggle)")
+	}
 	// reasoning.effort → adaptive thinking。值域与 Chat 侧 reasoning_effort 完全一致
 	// （low/medium/high/max/xhigh 透传、minimal→low，依据见 chatin.go 的 chatReasoningEffort），
 	// 直接复用同一实现，避免两条入站路径各写一份映射表。
@@ -164,18 +175,20 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 // responsesIgnoredWarnReasons 无上游对应能力的顶层字段的留痕文案。
 // 分级与 Chat 侧一致：良性丢失（上游本来就没有该维度的选择权）用 info: 前缀；
 // 行为性丢失（客户端以为限制已生效，实际不会）按警告计。
+//
+// parallel_tool_calls 不在其中：它有上游载体（并入 tool_choice.disable_parallel_tool_use），
+// 是**被消费**的字段，只在无法表达时才留痕（见 responsesToRequest 里的映射）。
 var responsesIgnoredWarnReasons = map[string]string{
-	"include":             "info: include ignored (upstream returns no log probabilities; reasoning signatures are always sent back as encrypted_content, so it needs no include entry)",
-	"truncation":          "info: truncation ignored (upstream applies its own context-window handling)",
-	"background":          "background ignored (upstream has no async execution mode)",
-	"service_tier":        "info: service_tier ignored (upstream has no service-tier selection)",
-	"safety_identifier":   "info: safety_identifier ignored (upstream has no end-user attribution field)",
-	"user":                "info: user ignored (upstream has no end-user attribution field)",
-	"metadata":            "info: metadata ignored (upstream has no metadata field)",
-	"text":                "text.format/verbosity ignored (upstream has no structured-output mode)",
-	"parallel_tool_calls": "info: parallel_tool_calls ignored (upstream decides parallel calls itself)",
-	"top_logprobs":        "info: top_logprobs ignored (upstream returns no log probabilities)",
-	"stream_options":      "info: stream_options ignored (usage is always emitted with the final events)",
+	"include":           "info: include ignored (upstream returns no log probabilities; reasoning signatures are always sent back as encrypted_content, so it needs no include entry)",
+	"truncation":        "info: truncation ignored (upstream applies its own context-window handling)",
+	"background":        "background ignored (upstream has no async execution mode)",
+	"service_tier":      "info: service_tier ignored (upstream has no service-tier selection)",
+	"safety_identifier": "info: safety_identifier ignored (upstream has no end-user attribution field)",
+	"user":              "info: user ignored (upstream has no end-user attribution field)",
+	"metadata":          "info: metadata ignored (upstream has no metadata field)",
+	"text":              "text.format/verbosity ignored (upstream has no structured-output mode)",
+	"top_logprobs":      "info: top_logprobs ignored (upstream returns no log probabilities)",
+	"stream_options":    "info: stream_options ignored (usage is always emitted with the final events)",
 }
 
 // ResponsesIgnoredWarnings 对原始报文做存在性探测，为每个「客户端发过、上游无能力」的字段

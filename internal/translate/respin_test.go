@@ -1155,7 +1155,11 @@ func TestResponsesToRequest_IgnoredFields(t *testing.T) {
 		// 只有 logprobs 是真的拿不到。
 		assertWarnsContain(t, warns,
 			"info: include ignored (upstream returns no log probabilities; reasoning signatures are always sent back as encrypted_content")
-		assertWarnsContain(t, warns, "info: parallel_tool_calls ignored")
+		// F9：parallel_tool_calls 不再是「无上游能力」的丢弃字段（它有 tool_choice 载体），
+		// 旧的 info 文案随之消失；这里没有工具，串行约束无处安放，故按 Chat 侧同款
+		// 行为性丢失文案 + WARN 分级留痕（不再是 info: 前缀）。
+		assertWarnsContain(t, warns,
+			"parallel_tool_calls ignored (upstream has no per-request parallel-call toggle)")
 		assertWarnsContain(t, warns, "info: metadata ignored")
 		assertWarnsContain(t, warns, "info: truncation ignored")
 		assertWarnsContain(t, warns, "store ignored")
@@ -1363,5 +1367,75 @@ func TestResponsesToRequest_PromptCacheKeyPropagates(t *testing.T) {
 	plain, _, _ := respin(t, `{"model":"m","input":"hi"}`)
 	if plain.PromptCacheKey != "" {
 		t.Errorf("PromptCacheKey = %q, want empty when the client did not declare one", plain.PromptCacheKey)
+	}
+}
+
+// F9：parallel_tool_calls 在 Responses 入站必须有映射。此前它只挂在安全丢弃清单上留一条
+// info（"parallel_tool_calls ignored"），字段本身完全被忽略——客户端发 false 也不会串行，
+// 与 Chat 侧（chatin.go 的 chatApplyParallelToolCalls）行为分叉。
+//
+// 修好后：false 经 tool_choice 侧的同名开关（disable_parallel_tool_use）落到信封顶层的
+// params.parallel_tool_calls；显式为 true 或未声明一律不动（上游默认即允许并行）。
+// 留痕口径与 Chat 侧完全一致：**只有**「显式 false 但本轮最终没有工具、无法表达」按行为性
+// 丢失留痕（去掉 info: 前缀即 WARN）；其余情形字段已被消费，绝不能再报 ignored。
+func TestResponsesToRequest_ParallelToolCalls(t *testing.T) {
+	const tools = `"tools":[{"type":"function","name":"f","parameters":{"type":"object"}}]`
+	cases := []struct {
+		name     string
+		fields   string
+		wantKey  bool // 信封 params.parallel_tool_calls 是否出现
+		wantWarn bool // 是否必须出现「无法表达」的行为性丢失留痕
+	}{
+		{"false-with-tools", `"parallel_tool_calls":false,` + tools, true, false},
+		{"false-without-tools", `"parallel_tool_calls":false`, false, true},
+		{"true-with-tools", `"parallel_tool_calls":true,` + tools, false, false},
+		{"absent-with-tools", tools, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, warns := respin(t, `{"model":"m","input":"go",`+tc.fields+`}`)
+			cc, _ := BuildCcRequest(out, testOpts())
+
+			// 落点断言：convertToolChoice 把 tool_choice.disable_parallel_tool_use 读成信封
+			// 顶层的 parallel_tool_calls（CcParams.ParallelToolCalls，omitempty 故 nil 时键不出现）。
+			if got := cc.Params.ParallelToolCalls != nil; got != tc.wantKey {
+				t.Fatalf("CcParams.ParallelToolCalls 是否设置 = %v, want %v (%v)",
+					got, tc.wantKey, cc.Params.ParallelToolCalls)
+			}
+			if tc.wantKey && *cc.Params.ParallelToolCalls {
+				t.Error("params.parallel_tool_calls = true, want false（客户端显式声明了 false）")
+			}
+			b, err := json.Marshal(cc)
+			if err != nil {
+				t.Fatalf("marshal envelope: %v", err)
+			}
+			var wire, params map[string]json.RawMessage
+			if err := json.Unmarshal(b, &wire); err != nil {
+				t.Fatalf("unmarshal envelope: %v", err)
+			}
+			if err := json.Unmarshal(wire["params"], &params); err != nil {
+				t.Fatalf("unmarshal params: %v", err)
+			}
+			raw, ok := params["parallel_tool_calls"]
+			if ok != tc.wantKey {
+				t.Errorf("信封 parallel_tool_calls 键存在性 = %v, want %v", ok, tc.wantKey)
+			} else if ok && string(raw) != "false" {
+				t.Errorf("信封 parallel_tool_calls = %s, want false", raw)
+			}
+
+			hasWarn := false
+			for _, w := range warns {
+				if strings.Contains(w, "parallel_tool_calls ignored") {
+					hasWarn = true
+				}
+				// 旧文案把整个字段当作无上游能力的丢弃项，修好后不得再出现
+				if strings.Contains(w, "upstream decides parallel calls itself") {
+					t.Errorf("字段已被消费，旧丢弃文案不得再出现: %q", w)
+				}
+			}
+			if hasWarn != tc.wantWarn {
+				t.Errorf("parallel_tool_calls 留痕 = %v, want %v\nwarns: %v", hasWarn, tc.wantWarn, warns)
+			}
+		})
 	}
 }
