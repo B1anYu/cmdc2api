@@ -81,6 +81,10 @@ func parseInboundMessages(msgs []types.InboundMessage) ([]pairingMessage, []stri
 
 // mergeSameRole 合并连续同角色消息（块按原顺序拼接）。
 // 只合并角色完全相同的相邻消息：未知角色原样保留，不与 user/assistant 混并。
+//
+// 这是刻意的中立：未知 role 的兜底（降级为 user）是**入站层**的职责，两条入站都已在
+// 归一化时做完（chatin.go 的 role switch default 分支、respin.go 的同名分支），
+// 因此本文件不该再持有一份可能与之分叉的角色策略。
 func mergeSameRole(msgs []pairingMessage) []pairingMessage {
 	out := make([]pairingMessage, 0, len(msgs))
 	for _, m := range msgs {
@@ -145,6 +149,12 @@ func pairToolCalls(msgs []pairingMessage) ([]pairingMessage, []string) {
 		case "user":
 			out = append(out, stripToolResults(m)...)
 		default:
+			// 未知角色原样保留（本文件对角色策略保持中立，见 mergeSameRole 的注释）。
+			// 从两条入站（chatin.go / respin.go）来的消息在这里都已降级为 user，
+			// 故本分支当前不可达；它保留为直调入口（RepairToolPairing 是导出函数）的安全出口——
+			// 注意不能在此就地改写成 user：结果索引按 role=="user" 收集 tool_result，
+			// 在派发阶段才改角色会让该消息里的 tool_result 既不被索引也不被剥离，
+			// 破坏不变式 1（结果必须紧邻其调用）。
 			out = append(out, m)
 		}
 	}

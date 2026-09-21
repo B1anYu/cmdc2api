@@ -107,7 +107,7 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 	// 工具声明在三处汇合：顶层 tools 优先，additional_tools item 次之，发现提升追加到最后。
 	tools, err := responsesTools(req.Tools, s.additional, s.discovered, s.mapping, &s.warns)
 	if err != nil {
-		return nil, nil, s.warns, err
+		return nil, nil, aggregateRequestWarns(s.warns), err
 	}
 	out.Tools = tools
 
@@ -116,7 +116,7 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 	s.warns = append(s.warns, pw...)
 	out.Messages = repaired
 	if len(out.Messages) == 0 {
-		return nil, nil, s.warns, ErrResponsesEmptyInput
+		return nil, nil, aggregateRequestWarns(s.warns), ErrResponsesEmptyInput
 	}
 
 	if len(s.systemParts) > 0 {
@@ -125,8 +125,9 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 	if tc := responsesToolChoice(req.ToolChoice, len(out.Tools) > 0, &s.warns); tc != nil {
 		out.ToolChoice = tc
 	}
-	// reasoning.effort → adaptive thinking。档位收敛规则与 Chat 侧 reasoning_effort 完全一致
-	// （上游只有 low/medium/high），直接复用同一实现，避免两条入站路径各写一份映射表。
+	// reasoning.effort → adaptive thinking。值域与 Chat 侧 reasoning_effort 完全一致
+	// （low/medium/high/max/xhigh 透传、minimal→low，依据见 chatin.go 的 chatReasoningEffort），
+	// 直接复用同一实现，避免两条入站路径各写一份映射表。
 	if req.Reasoning != nil {
 		if effort := chatReasoningEffort(chatJSON(req.Reasoning.Effort), &s.warns); effort != "" {
 			out.Thinking = chatJSON(struct {
@@ -146,7 +147,7 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 		s.warns = append(s.warns,
 			"store ignored (this proxy keeps no server-side state; previous_response_id is rejected)")
 	}
-	return out, s.mapping, s.warns, nil
+	return out, s.mapping, aggregateRequestWarns(s.warns), nil
 }
 
 // ---------- 安全丢弃字段留痕 ----------
@@ -155,7 +156,7 @@ func responsesToRequest(req *types.ResponsesRequest) (*types.Request, *Responses
 // 分级与 Chat 侧一致：良性丢失（上游本来就没有该维度的选择权）用 info: 前缀；
 // 行为性丢失（客户端以为限制已生效，实际不会）按警告计。
 var responsesIgnoredWarnReasons = map[string]string{
-	"include":             "info: include ignored (upstream returns neither logprobs nor encrypted content)",
+	"include":             "info: include ignored (upstream returns no log probabilities; reasoning signatures are always sent back as encrypted_content, so it needs no include entry)",
 	"truncation":          "info: truncation ignored (upstream applies its own context-window handling)",
 	"background":          "background ignored (upstream has no async execution mode)",
 	"service_tier":        "info: service_tier ignored (upstream has no service-tier selection)",
@@ -279,7 +280,7 @@ func (s *respinState) convertMessageItem(idx int, item *types.ResponsesInputItem
 	switch item.Role {
 	case "system", "developer":
 		// 与 Chat 侧同口径：两者都并入 system（Anthropic 只有 system 能承载全局指令）。
-		if txt := respinMessageText(item.Content); txt != "" {
+		if txt := s.systemText(idx, item.Content); txt != "" {
 			s.systemParts = append(s.systemParts, txt)
 		}
 	case "user":
@@ -291,7 +292,13 @@ func (s *respinState) convertMessageItem(idx int, item *types.ResponsesInputItem
 			s.msgs = append(s.msgs, types.InboundMessage{Role: "assistant", Content: InboundBlocksContent(blocks)})
 		}
 	default:
-		s.warnf("input item %d: unsupported role %q dropped", idx, item.Role)
+		// 未知 role 兜底为 user（保留内容），而不是整条丢弃：CC 的信封只有 user/assistant
+		// 两种角色，丢掉这条就把客户端历史里的一段内容从模型视野里抹掉了。
+		// 口径与 A 级参照 proxy.mjs 的 `{role:'user', content:[{type:'text', text:...}]}` 一致。
+		s.warnf("input item %d: unknown role %q downgraded to a user message (upstream accepts user/assistant roles only; its content is kept)", idx, item.Role)
+		if blocks := s.userBlocks(idx, item.Content); len(blocks) > 0 {
+			s.msgs = append(s.msgs, types.InboundMessage{Role: "user", Content: InboundBlocksContent(blocks)})
+		}
 	}
 }
 
@@ -310,7 +317,7 @@ func (s *respinState) convertToolCallItem(idx int, item *types.ResponsesInputIte
 			idx, item.Type, item.Name)
 		return
 	}
-	input := chatToolArgs(item.Arguments) // 空串或非法 JSON 兜底 {}
+	input := chatToolArgsReport(item.Name, item.Arguments, &s.warns) // 空串兜底 {}；非法 JSON 与非 object 留痕
 	if item.Type == "custom_tool_call" {
 		input = chatJSON(map[string]string{"input": item.Input})
 	}
@@ -403,8 +410,10 @@ func (s *respinState) convertToolSearchOutput(idx int, item *types.ResponsesInpu
 		s.warnf("input item %d: tool_search_output ignored (no tool_search declaration in this request)", idx)
 		return
 	}
-	if item.Status != "" && item.Status != types.ResponsesStatusCompleted {
-		s.warnf("input item %d: tool_search_output with status %q ignored (only completed results are promoted)",
+	// 只有 completed 才提升：缺失 status 同样不提升（空串不等于 completed，
+	// 认下它会与上一行的注释自相矛盾）。
+	if item.Status != types.ResponsesStatusCompleted {
+		s.warnf("input item %d: tool_search_output with status %q not promoted (only completed results are promoted; a missing status is not treated as completed, so the tools it discovered are not declared upstream)",
 			idx, item.Status)
 		return
 	}
@@ -453,19 +462,31 @@ func respinParts(raw json.RawMessage) ([]respinPart, error) {
 	return parts, nil
 }
 
-// respinMessageText 抽取 system/developer item 的纯文本。
+// systemText 抽取 system/developer item 的纯文本。
 // part 白名单与 Chat 侧共用（isChatTextPart）：Responses 的 input_text/output_text
 // 与 Chat 的 text 承载同一语义，多段按出现顺序以换行连接。
-func respinMessageText(raw json.RawMessage) string {
+//
+// 两条丢弃路径各留痕（与 userBlocks/assistantBlocks 同口径）：
+//   - 非文本 part（如 input_image）：Anthropic 的 system 段只承载文本，整段指令无处安放；
+//   - content 既非字符串也非 part 数组：解析失败。
+//
+// 返回空串有两种含义——「本来就没内容」与「内容被丢弃/解析失败」——前者不留痕，
+// 后者必定已经 warn，调用点据此可区分「空」与「坏」。
+func (s *respinState) systemText(idx int, raw json.RawMessage) string {
 	parts, err := respinParts(raw)
 	if err != nil {
+		s.warnf("input item %d (system/developer): content is neither string nor part array; dropped (these instructions are not sent upstream)", idx)
 		return ""
 	}
 	var texts []string
 	for _, p := range parts {
-		if isChatTextPart(p.Type) && p.Text != "" {
-			texts = append(texts, p.Text)
+		if isChatTextPart(p.Type) {
+			if p.Text != "" {
+				texts = append(texts, p.Text)
+			}
+			continue
 		}
+		s.warnf("input item %d (system/developer): unsupported content part %q dropped (the system prompt carries text only, so this instruction is not sent upstream)", idx, p.Type)
 	}
 	return strings.Join(texts, "\n")
 }
@@ -587,17 +608,18 @@ var respinToolSearchSchema = json.RawMessage(`{"type":"object","properties":{` +
 // respinToolSet 工具声明累积器：负责三类重名冲突的显式拒绝（§4.3 不允许静默降级）
 // 与发现提升的同名同 schema 去重。名字即身份——摊平名、代理名与原始名同处一个命名空间。
 type respinToolSet struct {
-	tools   []types.Tool
-	schemas map[string]string // 名字 → 规范化 schema 文本（同 schema 去重的依据）
-	origins map[string]string // 名字 → 声明来源（冲突文案要说清是谁跟谁撞了）
-	search  bool              // 是否已声明 tool_search
+	tools    []types.Tool
+	schemas  map[string]string // 名字 → 规范化 schema 文本（同 schema 去重的依据）
+	origins  map[string]string // 名字 → 声明来源（冲突文案要说清是谁跟谁撞了）
+	replaced []string          // 说明书被整体替换的工具名（按请求聚合成一条留痕，见 responsesTools）
+	search   bool              // 是否已声明 tool_search
 }
 
 // add 登记一个工具声明。dedupe 为真时，与既有声明同名同 schema 视为重复声明静默跳过
 // （Codex 会在后续轮次的 additional_tools / 发现结果里重发同一批工具）；
 // 其余重名一律报错——名字被覆盖意味着客户端声明的某个工具永远调不到。
 func (t *respinToolSet) add(name, description, origin string, schema json.RawMessage, dedupe bool) error {
-	schema = normalizeSchema(schema)
+	schema, wasReplaced := normalizeSchemaReport(schema)
 	key := string(schema)
 	if prev, ok := t.origins[name]; ok {
 		if dedupe && t.schemas[name] == key {
@@ -615,6 +637,10 @@ func (t *respinToolSet) add(name, description, origin string, schema json.RawMes
 	t.tools = append(t.tools, types.Tool{Name: name, Description: description, InputSchema: schema})
 	t.schemas[name] = key
 	t.origins[name] = origin
+	if wasReplaced {
+		// 只在真正登记时记录：被去重跳过的那次是同一份声明，报同一名字只会刷屏。
+		t.replaced = append(t.replaced, name)
+	}
 	return nil
 }
 
@@ -767,6 +793,12 @@ func responsesTools(top, additional, discovered []types.ResponsesTool,
 	}
 	if err := set.promote(discovered, mapping, warns); err != nil {
 		return nil, err
+	}
+	if len(set.replaced) > 0 {
+		// 与 Anthropic/Chat 侧 convertTools 同口径：同请求聚合成一条，附工具名。
+		*warns = append(*warns, fmt.Sprintf(
+			"tool parameters replaced with {\"type\":\"object\",\"properties\":{}} for %d tool(s) [%s]: the cmdc envelope requires input_schema to be an object and these Responses tool declarations were not (no parameters at all, top-level anyOf/oneOf, \"type\" missing or not \"object\", or invalid JSON). The model now sees them as parameterless tools, so their calls may arrive with empty or missing arguments — if one of them is affected and you need its real parameters, check the client-side tool declaration.",
+			len(set.replaced), strings.Join(set.replaced, ", ")))
 	}
 	return set.tools, nil
 }

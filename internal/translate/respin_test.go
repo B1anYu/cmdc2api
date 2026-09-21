@@ -159,6 +159,35 @@ func TestResponsesToRequest_SystemSegments(t *testing.T) {
 	}
 }
 
+// F12a：system/developer item 内的非文本 part 与「content 非 string 非数组」都必须留痕，
+// 且「空」（本来就没内容）与「坏」（内容被丢弃/解析失败）在留痕上可区分。
+func TestResponsesToRequest_SystemItemDrops(t *testing.T) {
+	out, _, warns := respin(t, `{
+		"model": "m",
+		"input": [
+			{"role": "developer", "content": [
+				{"type": "input_text", "text": "keep"},
+				{"type": "input_image", "image_url": "https://x/y.png"}
+			]},
+			{"role": "system", "content": 123},
+			{"role": "developer"},
+			{"role": "developer", "content": ""},
+			{"role": "user", "content": "hi"}
+		]
+	}`)
+	if got, want := string(out.System), `"keep"`; got != want {
+		t.Fatalf("system = %s, want %s (两条坏 item 都不该贡献内容)", got, want)
+	}
+	assertWarnsContain(t, warns,
+		`input item 0 (system/developer): unsupported content part "input_image" dropped`)
+	assertWarnsContain(t, warns,
+		`input item 1 (system/developer): content is neither string nor part array; dropped`)
+	// 空 content 不留痕：与「坏」区分开，否则真正的解析失败会被噪声淹没。
+	if got := countWarns(warns, "(system/developer)"); got != 2 {
+		t.Errorf("(system/developer) warn count = %d, want 2 (只有两条丢弃路径): %v", got, warns)
+	}
+}
+
 // max_output_tokens / temperature / top_p / stream 直传，≤0 留给信封构造兜底。
 func TestResponsesToRequest_ScalarFields(t *testing.T) {
 	out, _, _ := respin(t, `{"model":"m","input":"hi","max_output_tokens":4096,"temperature":0.3,"top_p":0.8,"stream":true}`)
@@ -217,7 +246,7 @@ func TestResponsesToRequest_MessageItems(t *testing.T) {
 		assertWarnsContain(t, warns, `input item 1 (assistant): unsupported content part "input_image" dropped`)
 	})
 
-	t.Run("empty-and-unknown-role-dropped", func(t *testing.T) {
+	t.Run("empty-content-and-unknown-role-downgraded", func(t *testing.T) {
 		out, _, warns := respin(t, `{
 			"model": "m",
 			"input": [
@@ -226,10 +255,42 @@ func TestResponsesToRequest_MessageItems(t *testing.T) {
 				{"role": "user", "content": "kept"}
 			]
 		}`)
-		if len(out.Messages) != 1 {
-			t.Fatalf("messages = %+v, want only the kept message", out.Messages)
+		// 空 content 不产消息；未知 role（F25）兜底为 user 且内容保留，与后一条 user 合并同类。
+		if got, want := rolesOf(out.Messages), []string{"user"}; !equalStrings(got, want) {
+			t.Fatalf("roles = %v, want %v", got, want)
 		}
-		assertWarnsContain(t, warns, `unsupported role "tool" dropped`)
+		blocks := blocksOf(t, out.Messages[0])
+		if !containsText(blocks, "x") || !containsText(blocks, "kept") {
+			t.Fatalf("unknown-role content lost: blocks = %+v", blocks)
+		}
+		assertWarnsContain(t, warns, `unknown role "tool" downgraded to a user message`)
+	})
+
+	t.Run("unknown-role-downgrade-keeps-parts", func(t *testing.T) {
+		// 兜底走 userBlocks：文本与合法图片都随内容一起保留，非法 part 仍按 user 口径留痕。
+		out, _, warns := respin(t, `{
+			"model": "m",
+			"input": [{"type": "message", "role": "critic", "content": [
+				{"type": "input_text", "text": "review this"},
+				{"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
+			]}]
+		}`)
+		blocks := blocksOf(t, out.Messages[0])
+		if got, want := blockTypes(blocks), []string{"text", "image"}; !equalStrings(got, want) {
+			t.Fatalf("blocks = %v, want %v", got, want)
+		}
+		assertWarnsContain(t, warns, `unknown role "critic" downgraded to a user message`)
+	})
+
+	t.Run("unknown-role-without-content-keeps-no-message", func(t *testing.T) {
+		out, _, warns := respin(t, `{
+			"model": "m",
+			"input": [{"type": "message", "role": "critic"}, {"role": "user", "content": "hi"}]
+		}`)
+		if got, want := rolesOf(out.Messages), []string{"user"}; !equalStrings(got, want) {
+			t.Fatalf("roles = %v, want %v", got, want)
+		}
+		assertWarnsContain(t, warns, `unknown role "critic" downgraded to a user message`)
 	})
 
 	t.Run("unparsable-content", func(t *testing.T) {
@@ -253,9 +314,12 @@ func TestResponsesToRequest_MessageItems(t *testing.T) {
 		if got, want := blockTypes(blocks), []string{"text"}; !equalStrings(got, want) {
 			t.Fatalf("blocks = %v, want %v", got, want)
 		}
-		if n := countWarns(warns, "unsupported or missing url dropped"); n != 2 {
-			t.Errorf("image drop warns = %d, want 2 (%v)", n, warns)
+		// 两条入站路径现在都做请求内聚合（aggregateRequestWarns）：两处同因丢弃折叠为
+		// 一条，保留首条原文并标明「另有 N 处同因」，故这里断言折叠后的形态而非条数。
+		if n := countWarns(warns, "unsupported or missing url dropped"); n != 1 {
+			t.Errorf("image drop warns = %d, want 1 aggregated line (%v)", n, warns)
 		}
+		assertWarnsContain(t, warns, "and 1 more of the same kind")
 	})
 }
 
@@ -545,6 +609,51 @@ func TestResponsesToRequest_Tools(t *testing.T) {
 	t.Run("strict-flag-warned", func(t *testing.T) {
 		_, _, warns := respin(t, `{"model":"m","input":"hi","tools":[{"type":"function","name":"s","strict":true,"parameters":{"type":"object"}}]}`)
 		assertWarnsContain(t, warns, "strict schema flag dropped")
+	})
+
+	// G1：非 object schema 被整体替换必须留痕（此前 Responses 入站走的是静默变体
+	// normalizeSchema，只有 Anthropic/Chat 侧的 convertTools 留痕）。
+	t.Run("non-object-schema-replacement-warned", func(t *testing.T) {
+		out, _, warns := respin(t, `{
+			"model": "m",
+			"input": "hi",
+			"tools": [
+				{"type": "function", "name": "union", "parameters": {"anyOf": [{"type": "object", "properties": {"a": {"type": "string"}}}]}},
+				{"type": "function", "name": "good", "parameters": {"type": "object", "properties": {"b": {"type": "string"}}}}
+			]
+		}`)
+		if got, want := toolNames(out.Tools), []string{"union", "good"}; !equalStrings(got, want) {
+			t.Fatalf("tools = %v, want %v", got, want)
+		}
+		schema := toolSchema(t, out.Tools[0])
+		props, _ := schema["properties"].(map[string]any)
+		if schema["type"] != "object" || len(props) != 0 {
+			t.Fatalf("union schema = %+v, want the empty-object default", schema)
+		}
+		// 同请求内聚合成一条，且只点名真正被替换的工具。
+		if got := countWarns(warns, "tool parameters replaced"); got != 1 {
+			t.Fatalf("replacement warn count = %d, want 1: %v", got, warns)
+		}
+		assertWarnsContain(t, warns, "[union]")
+		for _, w := range warns {
+			if strings.Contains(w, "tool parameters replaced") && strings.Contains(w, "good") {
+				t.Errorf("未被替换的工具不该出现在留痕里: %q", w)
+			}
+		}
+	})
+
+	// 重复声明（additional_tools 重发同一份坏 schema）不得重复留痕：聚合按请求去重。
+	t.Run("schema-replacement-aggregated-once", func(t *testing.T) {
+		bad := `{"type":"function","name":"union","parameters":{"anyOf":[{"type":"object"}]}}`
+		_, _, warns := respin(t, `{
+			"model": "m",
+			"input": [{"role": "user", "content": "go"}, {"type": "additional_tools", "tools": [`+bad+`]}],
+			"tools": [`+bad+`]
+		}`)
+		if got := countWarns(warns, "tool parameters replaced"); got != 1 {
+			t.Fatalf("replacement warn count = %d, want 1 (同请求聚合，重发不重复报): %v", got, warns)
+		}
+		assertWarnsContain(t, warns, "for 1 tool(s) [union]")
 	})
 
 	t.Run("custom-downgrade", func(t *testing.T) {
@@ -885,6 +994,23 @@ func TestResponsesToRequest_ToolSearchDiscovery(t *testing.T) {
 		assertWarnsContain(t, warns, "only completed results are promoted")
 	})
 
+	// F13：status 缺失不是 completed，不得提升（此前空串落空判定、直接进提升分支）。
+	t.Run("missing-status-not-promoted", func(t *testing.T) {
+		out, _, warns := respin(t, `{
+			"model": "m",
+			"input": [
+				{"role": "user", "content": "go"},
+				{"type": "tool_search_output", "tools": [{"type": "function", "name": "discovered", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}}]}
+			],
+			"tools": [`+toolSearch+`]
+		}`)
+		if got, want := toolNames(out.Tools), []string{responsesToolSearchName}; !equalStrings(got, want) {
+			t.Fatalf("tools = %v, want %v (缺 status 的输出不提升)", got, want)
+		}
+		assertWarnsContain(t, warns, `tool_search_output with status "" not promoted`)
+		assertWarnsContain(t, warns, "a missing status is not treated as completed")
+	})
+
 	t.Run("empty-and-unparsable", func(t *testing.T) {
 		out, _, warns := respin(t, `{
 			"model": "m",
@@ -979,8 +1105,10 @@ func TestResponsesToRequest_ReasoningEffort(t *testing.T) {
 		{"medium", `{"effort":"medium"}`, "medium"},
 		{"high", `{"effort":"high"}`, "high"},
 		{"minimal", `{"effort":"minimal"}`, "low"},
-		{"xhigh", `{"effort":"xhigh"}`, "high"},
-		{"max", `{"effort":"max"}`, "high"},
+		// xhigh / max 原样透传（用户亲批：上游有模型支持；xhigh 依据为对上游的实测认知，
+		// 无 A 级文档回执；minimal→low 是未验证的下映射）。
+		{"xhigh", `{"effort":"xhigh"}`, "xhigh"},
+		{"max", `{"effort":"max"}`, "max"},
 		{"none", `{"effort":"none"}`, ""},
 		{"empty", `{"effort":""}`, ""},
 		{"no-effort", `{"summary":"auto"}`, ""},
@@ -1023,7 +1151,10 @@ func TestResponsesToRequest_IgnoredFields(t *testing.T) {
 		raw := `{"model":"m","input":"go","include":["reasoning.encrypted_content"],"text":{"format":{"type":"json_schema"}},` +
 			`"parallel_tool_calls":false,"metadata":{"k":"v"},"store":true,"truncation":"auto"}`
 		_, _, warns := respin(t, raw)
-		assertWarnsContain(t, warns, "info: include ignored")
+		// F18：文案必须与事实一致——签名经 respout 以 encrypted_content 恒下发，
+		// 只有 logprobs 是真的拿不到。
+		assertWarnsContain(t, warns,
+			"info: include ignored (upstream returns no log probabilities; reasoning signatures are always sent back as encrypted_content")
 		assertWarnsContain(t, warns, "info: parallel_tool_calls ignored")
 		assertWarnsContain(t, warns, "info: metadata ignored")
 		assertWarnsContain(t, warns, "info: truncation ignored")

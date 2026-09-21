@@ -26,7 +26,7 @@ import (
 
 // ---------- 请求构造与上游 harness ----------
 
-// responsesAuth 测试用客户端鉴权头（getAPIKey 只认 user_ 前缀的 cmdc key）。
+// responsesAuth 测试用客户端鉴权头（getAPIKey 只做提取，不限前缀的 cmdc key）。
 var responsesAuth = map[string]string{"x-api-key": "user_test123"}
 
 // responsesTestModel 用回退列表里的模型名，保证 /v1/models 与 responses 两条路径可用同一名字。
@@ -1018,12 +1018,14 @@ func TestResponses_RequestValidation(t *testing.T) {
 		assertOpenAIError(t, body, "invalid_request_error", "invalid_request_error", "input must be a string or an array")
 	}
 
-	// 400：空 input 的各种形态（缺失 / 空串 / 空数组 / 内容全被丢弃）走同一个哨兵
+	// 400：空 input 的各种形态（缺失 / 空串 / 空数组 / 无可转换内容）走同一个哨兵。
+	// 注意 F25 之后「未知 role」不再等于「被丢弃」——它按 A 级参照降级为一条 user 消息
+	// （内容保留），故此处用「未知 role 且无 content」来构造真正的零内容输入。
 	for _, tc := range []struct{ name, body string }{
 		{"missing", `{"model":"m"}`},
 		{"empty_string", `{"model":"m","input":""}`},
 		{"empty_array", `{"model":"m","input":[]}`},
-		{"all_dropped", `{"model":"m","input":[{"role":"nobody","content":"hi"}]}`},
+		{"unknown_role_without_content", `{"model":"m","input":[{"role":"nobody"}]}`},
 	} {
 		status, body := post(t, tc.body, responsesAuth)
 		if status != http.StatusBadRequest {

@@ -68,8 +68,8 @@ func TestChatToRequest_UserContentShapes(t *testing.T) {
 		wantWarn   string
 	}{
 		{"string", `"hello"`, []string{"text"}, ""},
-		{"empty-string", `""`, nil, ""},
-		{"null", `null`, nil, ""},
+		{"empty-string", `""`, nil, "contributes no block and is dropped"},
+		{"null", `null`, nil, "contributes no block and is dropped"},
 		{"text-parts", `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, []string{"text", "text"}, ""},
 		{"data-uri-image", `[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,QUJD"}}]`, []string{"text", "image"}, ""},
 		{"https-image", `[{"type":"image_url","image_url":{"url":"https://x/y.png"}}]`, []string{"image"}, ""},
@@ -423,7 +423,10 @@ func TestChatToRequest_StopDropped(t *testing.T) {
 	}
 }
 
-// reasoning_effort → adaptive thinking（档位收敛）。
+// reasoning_effort → adaptive thinking。
+// 值域原样透传（A 级 README.md:100 列 low/medium/high/max + :365「pass-through」、
+// proxy.mjs:512-513 直接透传）；xhigh 无 A 级文档回执，依据是用户对上游的实测认知，
+// 这里只钉住「不再被收窄」；minimal→low 是未验证的下映射。
 func TestChatToRequest_ReasoningEffort(t *testing.T) {
 	cases := []struct {
 		name string
@@ -434,8 +437,9 @@ func TestChatToRequest_ReasoningEffort(t *testing.T) {
 		{"medium", `"medium"`, "medium"},
 		{"high", `"high"`, "high"},
 		{"minimal", `"minimal"`, "low"},
-		{"xhigh", `"xhigh"`, "high"},
-		{"max", `"max"`, "high"},
+		{"xhigh", `"xhigh"`, "xhigh"},
+		{"max", `"max"`, "max"},
+		{"uppercase", `"MAX"`, "max"},
 		{"object", `{"effort":"medium"}`, "medium"},
 		{"none", `"none"`, ""},
 		{"empty", `""`, ""},
@@ -683,14 +687,39 @@ func TestChatToRequest_ComposesWithBuildCcRequest(t *testing.T) {
 	}
 }
 
-// 未知角色丢弃并留痕。
+// 未知角色不再丢弃（F25）：按 A 级参照 proxy.mjs:467-468 降级为一条 user 消息，
+// 内容保留；留痕从「dropped」改为「downgraded」。
 func TestChatToRequest_UnknownRole(t *testing.T) {
 	out, warns := mustChatToRequest(t, chatReq(t,
 		`{"model":"m","messages":[{"role":"tool_result","content":"x"},{"role":"user","content":"q"}]}`))
+	// 降级后的 user 消息与后一条真 user 消息被合并（角色相同），内容必须都在
 	if len(out.Messages) != 1 {
-		t.Fatalf("messages = %+v", out.Messages)
+		t.Fatalf("messages = %+v, want one merged user message", out.Messages)
 	}
-	assertWarnsContain(t, warns, `unsupported role "tool_result" dropped`)
+	if out.Messages[0].Role != "user" {
+		t.Errorf("role = %q, want user", out.Messages[0].Role)
+	}
+	if !containsText(blocksOf(t, out.Messages[0]), "x") {
+		t.Errorf("unknown role content lost: %+v", blocksOf(t, out.Messages[0]))
+	}
+	if !containsText(blocksOf(t, out.Messages[0]), "q") {
+		t.Errorf("following user content lost: %+v", blocksOf(t, out.Messages[0]))
+	}
+	assertWarnsContain(t, warns, `unknown role "tool_result" downgraded to a user message`)
+}
+
+// 未知角色的 part 数组内容同样保留（走与真 user 消息相同的转换路径）。
+func TestChatToRequest_UnknownRoleKeepsParts(t *testing.T) {
+	out, warns := mustChatToRequest(t, chatReq(t,
+		`{"model":"m","messages":[{"role":"observer","content":[{"type":"text","text":"notice"},{"type":"image_url","image_url":{"url":"https://x/y.png"}}]}]}`))
+	if len(out.Messages) != 1 {
+		t.Fatalf("messages = %+v, want one downgraded user message", out.Messages)
+	}
+	blocks := blocksOf(t, out.Messages[0])
+	if len(blocks) != 2 || blocks[0].Text != "notice" || blocks[1].Type != "image" {
+		t.Errorf("blocks = %+v, want [text notice, image]", blocks)
+	}
+	assertWarnsContain(t, warns, `unknown role "observer" downgraded to a user message`)
 }
 
 // content 既不是字符串也不是数组（客户端 bug）：整条消息丢弃并留痕，
@@ -775,4 +804,266 @@ func TestChatToRequest_ReasoningEffortUnknown(t *testing.T) {
 		t.Errorf("thinking = %s, want unset", out.Thinking)
 	}
 	assertWarnsContain(t, warns, `unknown reasoning_effort "turbo"`)
+}
+
+// F6 端到端：透传值必须真的落进信封的 params.reasoning_effort（归一化层不再收窄）。
+func TestChatToRequest_ReasoningEffortReachesEnvelope(t *testing.T) {
+	cases := []struct{ effort, want string }{
+		{"low", "low"}, {"medium", "medium"}, {"high", "high"},
+		{"max", "max"}, {"xhigh", "xhigh"}, {"minimal", "low"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.effort, func(t *testing.T) {
+			req, warns := mustChatToRequest(t, chatReq(t,
+				`{"model":"m","reasoning_effort":"`+tc.effort+`","messages":[{"role":"user","content":"q"}]}`))
+			cc, _ := BuildCcRequest(req, testOpts())
+			if cc.Params.ReasoningEffort != tc.want {
+				t.Errorf("params.reasoning_effort = %q, want %q", cc.Params.ReasoningEffort, tc.want)
+			}
+			// 收窄被删除后，透传档位不得再产生任何留痕
+			for _, w := range warns {
+				if strings.Contains(w, "reasoning_effort") {
+					t.Errorf("透传档位不该留痕: %v", warns)
+				}
+			}
+		})
+	}
+}
+
+// F27：data URI 的 media-type 参数（RFC 2397）不得被当成编码标记——按最后一个 ';' 判 base64。
+// 白名单不放宽：非 base64 的 data URI 与白名单外 scheme 仍然被拒。
+func TestChatToRequest_ImageDataURIMetaParsing(t *testing.T) {
+	cases := []struct {
+		name     string
+		url      string
+		accepted bool
+		media    string
+	}{
+		{"plain-base64", "data:image/png;base64,QUJD", true, "image/png"},
+		{"charset-param", "data:image/png;charset=utf-8;base64,QUJD", true, "image/png"},
+		{"charset-and-extra-param", "data:image/jpeg;charset=utf-8;name=x;base64,QUJD", true, "image/jpeg"},
+		{"base64-uppercase", "data:image/webp;BASE64,QUJD", true, "image/webp"},
+		{"media-absent", "data:;base64,QUJD", true, "image/png"},
+		{"negative-no-encoding", "data:image/png;charset=utf-8,QUJD", false, ""},
+		{"negative-plain-text", "data:text/plain,hello", false, ""},
+		{"negative-shell-base64", "data:base64,QUJD", false, ""},
+		{"negative-no-comma", "data:image/png;base64", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, warns := mustChatToRequest(t, chatReq(t,
+				`{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"`+tc.url+`"}}]}]}`))
+			var src *types.ImageSource
+			if len(out.Messages) > 0 {
+				if blocks := blocksOf(t, out.Messages[0]); len(blocks) == 1 && blocks[0].Type == "image" {
+					src = blocks[0].Source
+				}
+			}
+			if !tc.accepted {
+				if src != nil {
+					t.Fatalf("url %q should be rejected, got source %+v", tc.url, src)
+				}
+				assertWarnsContain(t, warns, "unsupported url scheme dropped")
+				return
+			}
+			if src == nil {
+				t.Fatalf("url %q should be accepted, warns: %v", tc.url, warns)
+			}
+			if src.Type != "base64" || src.MediaType != tc.media || src.Data != "QUJD" {
+				t.Errorf("source = %+v, want base64/%s/QUJD", src, tc.media)
+			}
+		})
+	}
+}
+
+// F12b：空 content（"" / null / []）与「全是空 text part」会让整条消息从信封里消失，
+// user 与 assistant 两条路径都必须留痕。
+func TestChatToRequest_EmptyContentWarned(t *testing.T) {
+	cases := []struct{ name, content string }{
+		{"empty-string", `""`},
+		{"null", `null`},
+		{"empty-array", `[]`},
+		{"all-empty-text-parts", `[{"type":"text","text":""},{"type":"text","text":""}]`},
+	}
+	for _, tc := range cases {
+		for _, role := range []string{"user", "assistant"} {
+			t.Run(role+"-"+tc.name, func(t *testing.T) {
+				out, warns := mustChatToRequest(t, chatReq(t,
+					`{"model":"m","messages":[{"role":"`+role+`","content":`+tc.content+`}]}`))
+				if len(out.Messages) != 0 {
+					t.Fatalf("messages = %+v, want none", out.Messages)
+				}
+				assertWarnsContain(t, warns, "contributes no block and is dropped")
+			})
+		}
+	}
+}
+
+// F12c：system 里的非文本 part 被忽略、以及 content 解析失败，都必须留痕且文案可区分。
+func TestChatToRequest_SystemContentWarns(t *testing.T) {
+	t.Run("non-text-part-ignored", func(t *testing.T) {
+		out, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+			{"role":"system","content":[{"type":"text","text":"be brief"},{"type":"image_url","image_url":{"url":"https://x/y.png"}}]},
+			{"role":"user","content":"q"}]}`))
+		if string(out.System) != `"be brief"` {
+			t.Errorf("system = %s, want only the text part", out.System)
+		}
+		assertWarnsContain(t, warns, `non-text content part(s) ignored [image_url]`)
+	})
+
+	t.Run("malformed-content", func(t *testing.T) {
+		out, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+			{"role":"system","content":123},{"role":"user","content":"q"}]}`))
+		if len(out.System) != 0 {
+			t.Errorf("system = %s, want unset", out.System)
+		}
+		assertWarnsContain(t, warns, "the whole system text of this message is dropped")
+	})
+
+	t.Run("empty-system-is-a-no-op", func(t *testing.T) {
+		_, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+			{"role":"system","content":""},{"role":"user","content":"q"}]}`))
+		if len(warns) != 0 {
+			t.Errorf("空 system 是 no-op，不该留痕: %v", warns)
+		}
+	})
+}
+
+// F12d：type 非 "function" 但载荷仍在 function.{name,arguments} 的调用照常转换（暂不丢弃）
+// 并留痕；computer_use 这类没有载体的类型（Function.Name 必为空）走既有分支留痕丢弃。
+func TestChatToRequest_ToolCallTypeNotValidated(t *testing.T) {
+	t.Run("payload-in-function", func(t *testing.T) {
+		out, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":"x","tool_calls":[
+				{"id":"call_1","type":"computer_use","function":{"name":"click","arguments":"{\"x\":1}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}]}`))
+		assertPairing(t, out.Messages)
+		blocks := blocksOf(t, out.Messages[1])
+		if len(blocks) != 2 || blocks[1].Type != "tool_use" || blocks[1].Name != "click" {
+			t.Fatalf("blocks = %+v, want [text, tool_use click]", blocks)
+		}
+		assertWarnsContain(t, warns, `tool_call "click" declares type "computer_use" instead of "function"`)
+	})
+
+	t.Run("no-function-payload", func(t *testing.T) {
+		// 真正没有载体的类型：Function.Name 为空，只能整条丢弃（并说清原因）；
+		// 同一消息里的文本内容照旧保留。
+		out, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+			{"role":"user","content":"q"},
+			{"role":"assistant","content":"x","tool_calls":[{"id":"call_1","type":"computer_use"}]}]}`))
+		if len(out.Messages) != 2 {
+			t.Fatalf("messages = %+v, want the user message and the text-only assistant message", out.Messages)
+		}
+		for _, b := range blocksOf(t, out.Messages[1]) {
+			if b.Type == "tool_use" {
+				t.Errorf("tool_use without a function payload must be dropped: %+v", b)
+			}
+		}
+		assertWarnsContain(t, warns, "tool_call without function name dropped")
+		for _, w := range warns {
+			if strings.Contains(w, "declares type") {
+				t.Errorf("无 function 载荷的类型不该报「declares type」留痕: %v", warns)
+			}
+		}
+	})
+}
+
+// F12e：chatToolArgs 的两条静默路径都必须留痕——非法 JSON 兜底 {} 丢了原文，
+// 合法但非 object 的值原样透传（不强制包一层，已拍板）。
+func TestChatToRequest_ToolArgsWarns(t *testing.T) {
+	cases := []struct {
+		name     string
+		args     string
+		want     string
+		wantWarn string
+	}{
+		{"object", `{"a":1}`, `{"a":1}`, ""},
+		{"empty", ``, `{}`, ""},
+		{"blank", `   `, `{}`, ""},
+		{"invalid-json", `{"a":`, `{}`, "arguments are not valid JSON"},
+		{"invalid-json-truncated", `{"a":1`, `{}`, "arguments are not valid JSON"},
+		{"non-object-string", `"123"`, `"123"`, "arguments are valid JSON but not an object"},
+		{"non-object-array", `[1,2]`, `[1,2]`, "arguments are valid JSON but not an object"},
+		{"null", `null`, `null`, "arguments are valid JSON but not an object"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			quoted, err := json.Marshal(tc.args)
+			if err != nil {
+				t.Fatalf("marshal args: %v", err)
+			}
+			out, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+				{"role":"user","content":"q"},
+				{"role":"assistant","content":"x","tool_calls":[
+					{"id":"call_1","type":"function","function":{"name":"f","arguments":`+string(quoted)+`}}]},
+				{"role":"tool","tool_call_id":"call_1","content":"ok"}]}`))
+			assertPairing(t, out.Messages)
+			blocks := blocksOf(t, out.Messages[1])
+			if len(blocks) != 2 || blocks[1].Type != "tool_use" {
+				t.Fatalf("blocks = %+v, want [text, tool_use]", blocks)
+			}
+			if got := string(blocks[1].Input); got != tc.want {
+				t.Errorf("tool_use.input = %s, want %s", got, tc.want)
+			}
+			if tc.wantWarn == "" {
+				if len(warns) != 0 {
+					t.Errorf("unexpected warns: %v", warns)
+				}
+				return
+			}
+			assertWarnsContain(t, warns, `tool call "f": `+tc.wantWarn)
+		})
+	}
+}
+
+// A′ 口径 2：同一家族在请求内只出一条（首条原文 + 其余以计数与明细附后），长对话不刷屏。
+func TestChatToRequest_WarnAggregation(t *testing.T) {
+	_, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+		{"role":"observer","content":"1"},{"role":"user","content":"a"},
+		{"role":"observer","content":"2"},{"role":"user","content":"b"},
+		{"role":"observer","content":"3"},{"role":"user","content":"c"}]}`))
+	n := 0
+	for _, w := range warns {
+		if !strings.Contains(w, "downgraded to a user message") {
+			continue
+		}
+		n++
+		if !strings.Contains(w, "and 2 more of the same kind in this request") {
+			t.Errorf("聚合缺失计数与明细: %s", w)
+		}
+	}
+	if n != 1 {
+		t.Fatalf("同家族留痕 %d 条, want 1（聚合成一条）: %v", n, warns)
+	}
+	// 首条原文完整保留（用户可直接贴进 issue）
+	assertWarnsContain(t, warns, `message 0: unknown role "observer" downgraded to a user message`)
+	assertWarnsContain(t, warns, `message 2: unknown role "observer" downgraded to a user message`)
+}
+
+// 聚合不得把不同家族（不同成因或不同对象）并成一条。
+func TestChatToRequest_WarnAggregationKeepsFamiliesApart(t *testing.T) {
+	_, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+		{"role":"user","content":""},
+		{"role":"assistant","content":""}]}`))
+	assertWarnsContain(t, warns, "(user): content is empty")
+	assertWarnsContain(t, warns, "(assistant): content is empty")
+	for _, w := range warns {
+		if strings.Contains(w, "more of the same kind") {
+			t.Errorf("不同家族被误聚合: %s", w)
+		}
+	}
+}
+
+// 聚合是请求内行为：留痕键只折叠数字，不同工具名仍各自成条。
+func TestChatToRequest_WarnAggregationKeepsDistinctTools(t *testing.T) {
+	_, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
+		{"role":"user","content":"q"},
+		{"role":"assistant","content":"x","tool_calls":[
+			{"id":"call_1","type":"function","function":{"name":"a","arguments":"oops"}},
+			{"id":"call_2","type":"function","function":{"name":"b","arguments":"oops"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":"1"},
+		{"role":"tool","tool_call_id":"call_2","content":"2"}]}`))
+	assertWarnsContain(t, warns, `tool call "a": arguments are not valid JSON`)
+	assertWarnsContain(t, warns, `tool call "b": arguments are not valid JSON`)
 }

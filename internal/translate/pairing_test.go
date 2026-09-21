@@ -398,6 +398,26 @@ func TestRepairToolPairing_MergeKeepsReasoning(t *testing.T) {
 	}
 }
 
+// 未知角色对本文件保持中立：既不丢弃也不改写角色，更不与 user/assistant 混并。
+// 降级为 user 是入站层的职责（chatin.go / respin.go 的 role switch default 分支），
+// 这里钉住该契约：任何未知角色都不会在本文件里被悄悄改写成 user。
+func TestRepairToolPairing_UnknownRoleLeftUntouched(t *testing.T) {
+	out, warns := RepairToolPairing([]types.InboundMessage{
+		pmsg("user", ptext("q")),
+		pmsg("observer", ptext("notice")),
+		pmsg("user", ptext("a")),
+	})
+	if len(warns) != 0 {
+		t.Errorf("unexpected warns: %v", warns)
+	}
+	if got, want := rolesOf(out), []string{"user", "observer", "user"}; !equalStrings(got, want) {
+		t.Fatalf("roles = %v, want %v（未知角色不得被改写或混并）", got, want)
+	}
+	if !containsText(blocksOf(t, out[1]), "notice") {
+		t.Error("unknown-role content lost inside pairing")
+	}
+}
+
 // ---------- 小工具 ----------
 
 func equalStrings(a, b []string) bool {

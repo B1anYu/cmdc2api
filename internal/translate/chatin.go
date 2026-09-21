@@ -65,7 +65,7 @@ func chatToRequest(req *types.ChatRequest) (*types.Request, []string, error) {
 		switch m.Role {
 		case "system", "developer":
 			// developer 与 system 都并入 system：Anthropic 只有 system 一处能承载全局指令
-			if txt := chatMessageText(m.Content); txt != "" {
+			if txt := chatMessageText(i, m, &warns); txt != "" {
 				systemParts = append(systemParts, txt)
 			}
 		case "user":
@@ -81,7 +81,16 @@ func chatToRequest(req *types.ChatRequest) (*types.Request, []string, error) {
 				msgs = append(msgs, msg)
 			}
 		default:
-			warns = append(warns, fmt.Sprintf("message %d: unsupported role %q dropped", i, m.Role))
+			// 未知 role 不丢弃：降级为一条 user 消息，内容照常转换后保留（F25）。
+			// 依据是 A 级参照的兜底分支（proxy.mjs:467-468 `return {role:'user', content:[...]}`，
+			// 注释理由是避免 CC 侧对非 user/assistant 角色做校验拒绝）。
+			// 留痕保留，但从「丢弃」改为「降级」：客户端发错 role 时仍能自查内容去哪了。
+			// 降级留痕先写：它是这条消息的主因，内容侧的细节留痕跟在其后更好读。
+			warns = append(warns, fmt.Sprintf(
+				"message %d: unknown role %q downgraded to a user message (upstream accepts user/assistant roles only; its content is kept)", i, m.Role))
+			if blocks := chatUserBlocks(i, m, &warns); len(blocks) > 0 {
+				msgs = append(msgs, types.InboundMessage{Role: "user", Content: InboundBlocksContent(blocks)})
+			}
 		}
 	}
 	if len(systemParts) > 0 {
@@ -111,7 +120,82 @@ func chatToRequest(req *types.ChatRequest) (*types.Request, []string, error) {
 	}
 
 	warns = append(warns, chatDroppedFieldWarnings(req, parallelApplied)...)
-	return out, warns, nil
+	// A′ 口径 2：同一个客户端小毛病会在长对话里逐条复发（每条历史消息各一条），
+	// 逐条打日志既刷屏又难引用。聚合放在最后，因此它同时覆盖配对修复产出的留痕。
+	return out, aggregateRequestWarns(warns), nil
+}
+
+// aggregateRequestWarns 把同一请求内「同一家族」的重复留痕聚合成一条，首条原文保留，
+// 其余以「另 N 处同因」+ 明细列表附在其后（明细最多列 3 条，避免单行日志过长）。
+//
+// 家族键 = 文案里所有数字段归一化为 '#'：于是 "message 3 (user): ... dropped" 与
+// "message 7 (user): ... dropped" 归为同一家族，而不同成因/不同对象（工具名、part 类型）的
+// 留痕仍各自成条。键只用于分组，输出永远是完整原文，用户可以直接贴进 issue。
+//
+// 命名不带协议前缀：**两条入站路径共用**（chatin.go 与 respin.go），
+// 依据是「双入站留痕口径一致」这一项目不变式。
+func aggregateRequestWarns(warns []string) []string {
+	if len(warns) < 2 {
+		return warns
+	}
+	type family struct {
+		first string
+		rest  []string
+	}
+	order := make([]string, 0, len(warns))
+	families := make(map[string]*family, len(warns))
+	for _, w := range warns {
+		key := chatWarnFamilyKey(w)
+		f, ok := families[key]
+		if !ok {
+			families[key] = &family{first: w}
+			order = append(order, key)
+			continue
+		}
+		f.rest = append(f.rest, w)
+	}
+	out := make([]string, 0, len(order))
+	for _, key := range order {
+		f := families[key]
+		if len(f.rest) == 0 {
+			out = append(out, f.first)
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s (and %d more of the same kind in this request: %s)",
+			f.first, len(f.rest), strings.Join(limitWarnDetails(f.rest, 3), "; ")))
+	}
+	return out
+}
+
+// chatWarnFamilyKey 生成聚合键：连续数字段折叠为单个 '#'（message 索引等只有定位价值，
+// 不参与家族判定）。
+func chatWarnFamilyKey(w string) string {
+	var b strings.Builder
+	b.Grow(len(w))
+	inDigits := false
+	for i := 0; i < len(w); i++ {
+		c := w[i]
+		if c >= '0' && c <= '9' {
+			if !inDigits {
+				b.WriteByte('#')
+				inDigits = true
+			}
+			continue
+		}
+		inDigits = false
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// limitWarnDetails 截断明细列表（超出部分以计数收尾）。
+func limitWarnDetails(items []string, max int) []string {
+	if len(items) <= max {
+		return items
+	}
+	out := make([]string, 0, max+1)
+	out = append(out, items[:max]...)
+	return append(out, fmt.Sprintf("... +%d more", len(items)-max))
 }
 
 // chatToolChoiceParallel 带并行开关的 tool_choice 线上形态。
@@ -269,21 +353,37 @@ func parseChatContent(raw json.RawMessage) (string, []types.ChatContentPart, err
 	return "", parts, nil
 }
 
-// chatMessageText 抽取 system/developer 消息的纯文本：字符串直取，part 数组只取文本块，
-// 非文本 part 静默忽略（系统提示里的图片本就没有上游载体）。
-func chatMessageText(raw json.RawMessage) string {
-	text, parts, err := parseChatContent(raw)
+// chatMessageText 抽取 system/developer 消息的纯文本：字符串直取，part 数组只取文本块。
+// 两条静默路径都必须留痕（F12c）：
+//   - 非文本 part（系统提示里的图片本就没有上游载体）会让该段 system 内容的一部分蒸发；
+//   - 解析失败时 parseChatContent 与「内容为空」一样返回 ""，不留痕就分不出
+//     「客户端没写」与「我们读不懂」，这两种情形的排查方向完全相反。
+//
+// 内容确实为空（"" / null / 空数组）属 no-op，不是丢失，故不留痕。
+func chatMessageText(idx int, m *types.ChatMessage, warns *[]string) string {
+	text, parts, err := parseChatContent(m.Content)
 	if err != nil {
+		*warns = append(*warns, fmt.Sprintf(
+			"message %d (%s): content is neither string nor part array; the whole system text of this message is dropped (this is a malformed content value, not an empty one)", idx, m.Role))
 		return ""
 	}
 	if parts == nil {
 		return text
 	}
-	var texts []string
+	var texts, ignored []string
 	for _, p := range parts {
-		if isChatTextPart(p.Type) && p.Text != "" {
-			texts = append(texts, p.Text)
+		if isChatTextPart(p.Type) {
+			if p.Text != "" {
+				texts = append(texts, p.Text)
+			}
+			continue
 		}
+		ignored = append(ignored, p.Type)
+	}
+	if len(ignored) > 0 {
+		*warns = append(*warns, fmt.Sprintf(
+			"message %d (%s): %d non-text content part(s) ignored [%s]; the upstream system prompt is text-only, so this much of the system instruction is not sent and the model never sees it",
+			idx, m.Role, len(ignored), strings.Join(ignored, ", ")))
 	}
 	return strings.Join(texts, "\n")
 }
@@ -298,39 +398,47 @@ func isChatTextPart(typ string) bool {
 // 图片按 URL 形态分流：data: URI 解成 base64 source，http(s) URL 原样交给上游抓取
 // （代理端不做下载：零依赖且没有可控的超时/体积上限，会把请求路径变成不可控的阻塞点）。
 func chatUserBlocks(idx int, m *types.ChatMessage, warns *[]string) []types.Block {
+	warned := len(*warns)
 	text, parts, err := parseChatContent(m.Content)
 	if err != nil {
 		*warns = append(*warns, fmt.Sprintf("message %d (user): content is neither string nor part array; dropped", idx))
 		return nil
 	}
-	if parts == nil {
-		if text == "" {
-			return nil
-		}
-		return []types.Block{{Type: "text", Text: text}}
-	}
 	blocks := make([]types.Block, 0, len(parts))
-	for _, p := range parts {
-		switch {
-		case isChatTextPart(p.Type):
-			if p.Text == "" {
-				continue
-			}
-			blocks = append(blocks, types.Block{Type: "text", Text: p.Text})
-		case p.Type == "image_url":
-			if p.ImageURL == nil || p.ImageURL.URL == "" {
-				*warns = append(*warns, fmt.Sprintf("message %d (user): image_url without url dropped", idx))
-				continue
-			}
-			src, ok := chatImageSource(p.ImageURL.URL)
-			if !ok {
-				*warns = append(*warns, fmt.Sprintf("message %d (user): image with unsupported url scheme dropped", idx))
-				continue
-			}
-			blocks = append(blocks, types.Block{Type: "image", Source: src})
-		default:
-			*warns = append(*warns, fmt.Sprintf("message %d (user): unsupported content part %q dropped", idx, p.Type))
+	if parts == nil {
+		if text != "" {
+			blocks = append(blocks, types.Block{Type: "text", Text: text})
 		}
+	} else {
+		for _, p := range parts {
+			switch {
+			case isChatTextPart(p.Type):
+				if p.Text == "" {
+					continue
+				}
+				blocks = append(blocks, types.Block{Type: "text", Text: p.Text})
+			case p.Type == "image_url":
+				if p.ImageURL == nil || p.ImageURL.URL == "" {
+					*warns = append(*warns, fmt.Sprintf("message %d (user): image_url without url dropped", idx))
+					continue
+				}
+				src, ok := chatImageSource(p.ImageURL.URL)
+				if !ok {
+					*warns = append(*warns, fmt.Sprintf("message %d (user): image with unsupported url scheme dropped", idx))
+					continue
+				}
+				blocks = append(blocks, types.Block{Type: "image", Source: src})
+			default:
+				*warns = append(*warns, fmt.Sprintf("message %d (user): unsupported content part %q dropped", idx, p.Type))
+			}
+		}
+	}
+	// F12b：空 content（"" / null / []）与「全是空 text part」是客户端常见写法，
+	// 但整条消息会从信封里消失——用户看不出「我发的话为什么没了」，必须留痕。
+	// 若本条消息已有别的留痕（坏图片、未知 part），成因已经说清，不重复报。
+	if len(blocks) == 0 && len(*warns) == warned {
+		*warns = append(*warns, fmt.Sprintf(
+			"message %d (user): content is empty (or every text part is empty and nothing else survived); the message contributes no block and is dropped", idx))
 	}
 	return blocks
 }
@@ -342,10 +450,14 @@ func chatImageSource(url string) (*types.ImageSource, bool) {
 		if !ok || data == "" {
 			return nil, false
 		}
-		media, encoding, ok := strings.Cut(meta, ";")
-		if !ok || !strings.EqualFold(encoding, "base64") {
+		// meta 形如 "image/png;base64" 或带 media-type 参数的 "image/png;charset=utf-8;base64"
+		// （RFC 2397 允许参数，且 ;base64 固定在末尾）。因此按 ';' 全切后判**末段**：
+		// 只取第一个 ';' 会把 charset 参数当成编码标记，误拒完全合法的 data URI（F27）。
+		segs := strings.Split(meta, ";")
+		if len(segs) < 2 || !strings.EqualFold(segs[len(segs)-1], "base64") {
 			return nil, false
 		}
+		media := segs[0]
 		if media == "" {
 			media = "image/png"
 		}
@@ -361,6 +473,7 @@ func chatImageSource(url string) (*types.ImageSource, bool) {
 // 次序固定为 [thinking, text, tool-call]（对齐 CC CLI 抓包，见 request.go convertAssistant）：
 // 上游对思考块的相对位置敏感，历史里的块次序不能随客户端书写习惯漂移。
 func chatAssistantBlocks(idx int, m *types.ChatMessage, warns *[]string) []types.Block {
+	warned := len(*warns)
 	var thinking, texts, toolUses []types.Block
 
 	if rc := chatReasoningText(m); rc != "" {
@@ -399,6 +512,15 @@ func chatAssistantBlocks(idx int, m *types.ChatMessage, warns *[]string) []types
 
 	for j := range m.ToolCalls {
 		tc := &m.ToolCalls[j]
+		if tc.Type != "" && tc.Type != "function" && tc.Function.Name != "" {
+			// F12d：type 不是 "function" 却仍把载荷放在 function.{name,arguments}。
+			// 暂不丢弃（无证据表明上游需要区分类型），照 function 调用转换，但必须留痕。
+			// 真正没有载体的类型（computer_use 等）在这里无从表达——types.ChatToolCall 只有
+			// ID/Type/Function，没有 Custom/Computer 字段，那种调用的 Function.Name 必为空，
+			// 由下面的「without function name」分支连内容一起留痕丢弃。
+			*warns = append(*warns, fmt.Sprintf(
+				"message %d (assistant): tool_call %q declares type %q instead of \"function\"; converted as a function call anyway because its payload is in function.name/function.arguments", idx, tc.Function.Name, tc.Type))
+		}
 		if tc.Function.Name == "" {
 			*warns = append(*warns, fmt.Sprintf("message %d (assistant): tool_call without function name dropped", idx))
 			continue
@@ -409,7 +531,7 @@ func chatAssistantBlocks(idx int, m *types.ChatMessage, warns *[]string) []types
 			continue
 		}
 		toolUses = append(toolUses, types.Block{
-			Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: chatToolArgs(tc.Function.Arguments),
+			Type: "tool_use", ID: tc.ID, Name: tc.Function.Name, Input: chatToolArgsReport(tc.Function.Name, tc.Function.Arguments, warns),
 		})
 	}
 
@@ -417,6 +539,12 @@ func chatAssistantBlocks(idx int, m *types.ChatMessage, warns *[]string) []types
 	blocks = append(blocks, thinking...)
 	blocks = append(blocks, texts...)
 	blocks = append(blocks, toolUses...)
+	// F12b：空 content（"" / null / []）或全是空 text part，且没有思考与可用工具调用时，
+	// 整条消息从信封里消失；成因不再有别的留痕可依，这里补一条。
+	if len(blocks) == 0 && len(*warns) == warned {
+		*warns = append(*warns, fmt.Sprintf(
+			"message %d (assistant): content is empty (or every text part is empty) and there is no thinking text or usable tool call; the message contributes no block and is dropped", idx))
+	}
 	return blocks
 }
 
@@ -454,12 +582,28 @@ func chatReasoningText(m *types.ChatMessage) string {
 	return ""
 }
 
-// chatToolArgs 解析工具调用参数。空串或非法 JSON 兜底为 {}：
-// Anthropic 的 tool_use.input 必须是对象，半截 JSON 混进历史会让后续每一轮都 400。
-func chatToolArgs(args string) json.RawMessage {
+// chatToolArgsReport 解析工具调用参数并把两条静默路径留痕（F12e）。
+// 两条入站路径共用（Chat 的 assistantBlocks 与 Responses 的 tool_call item），
+// 以保证双入站留痕口径一致 —— 原先的静默单参入口已删除（无调用点即为死代码）。
+// 空串兜底为 {} 是既定形态（Anthropic 的 tool_use.input 必须是对象，且空参数调用是常态），
+// 不留痕；其余两条路径都会改变客户端看到的东西，必须留痕：
+//   - 非法 JSON → 兜底 {}，原始文本就此丢失（{} 兜底本身对齐 A 级参照 proxy.mjs:542-544）；
+//   - 合法 JSON 但不是对象（"123"、"[1,2]"、"\""x\""、"null"）→ 原样透传。
+//     上游是否接受非 object 的 input 无任何级别证据，本代理不擅自包一层（已拍板）。
+func chatToolArgsReport(tool, args string, warns *[]string) json.RawMessage {
 	trimmed := strings.TrimSpace(args)
-	if trimmed == "" || !json.Valid([]byte(trimmed)) {
+	if trimmed == "" {
 		return json.RawMessage("{}")
+	}
+	if !json.Valid([]byte(trimmed)) {
+		*warns = append(*warns, fmt.Sprintf(
+			"tool call %q: arguments are not valid JSON; replaced with {} and the original text is lost (the model's call now arrives with empty arguments)", tool))
+		return json.RawMessage("{}")
+	}
+	// 合法 JSON 且以 '{' 开头 ⟺ 是 object（合法 JSON 的其它形态不会以 '{' 开头）。
+	if trimmed[0] != '{' {
+		*warns = append(*warns, fmt.Sprintf(
+			"tool call %q: arguments are valid JSON but not an object (%s); passed through unchanged because the upstream accepts only objects here — this call may be rejected upstream", tool, trimmed))
 	}
 	return json.RawMessage(trimmed)
 }
@@ -629,8 +773,14 @@ func chatToolChoice(raw json.RawMessage, hasTools bool, warns *[]string) json.Ra
 }
 
 // chatReasoningEffort reasoning_effort → cmdc reasoning_effort 档位（走 adaptive 分支）。
-// 上游只认 low/medium/high，因此 minimal→low、xhigh/max→high 做档位收敛；
-// none/空表示不启用思考，不设置字段。
+//
+// 值域**原样透传**，不做档位收敛。依据分级如下，勿混为一谈：
+//   - low/medium/high/max：A 级参照明写值域（README.md:100）并明写该字段是 pass-through
+//     （README.md:365），实现亦直接透传、不做任何映射（proxy.mjs:512-513）。
+//   - xhigh：**不在**上述 A 级文档的值域内；其支持依据是用户对上游的实测认知（无文档回执）。
+//   - minimal：OpenAI 侧档位，不在上游值域内，这里下映射为 low——该映射**未经上游验证**。
+//
+// none/空表示不启用思考，不设置字段；其余未知值留痕并不启用（不猜测上游语义）。
 func chatReasoningEffort(raw json.RawMessage, warns *[]string) string {
 	if len(raw) == 0 || string(raw) == "null" {
 		return ""
@@ -650,15 +800,14 @@ func chatReasoningEffort(raw json.RawMessage, warns *[]string) string {
 		}
 		effort = obj.Effort
 	}
-	switch strings.ToLower(strings.TrimSpace(effort)) {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	switch effort {
 	case "", "none":
 		return ""
-	case "low", "medium", "high":
-		return strings.ToLower(strings.TrimSpace(effort))
+	case "low", "medium", "high", "max", "xhigh":
+		return effort
 	case "minimal":
 		return "low"
-	case "xhigh", "max":
-		return "high"
 	default:
 		*warns = append(*warns, fmt.Sprintf("unknown reasoning_effort %q ignored", effort))
 		return ""
