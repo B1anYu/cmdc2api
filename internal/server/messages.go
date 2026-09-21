@@ -14,8 +14,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := getAPIKey(r.Header)
 	if apiKey == "" {
-		anthropicError(w, http.StatusUnauthorized, "authentication_error",
-			"Missing API key. Send in Authorization: Bearer <key> or x-api-key header", 0)
+		writeMissingAPIKey(w, anthropicErrors{})
 		return
 	}
 	var areq types.Request

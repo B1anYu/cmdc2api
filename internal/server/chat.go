@@ -25,8 +25,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := getAPIKey(r.Header)
 	if apiKey == "" {
-		openaiErrors{}.Write(w, http.StatusUnauthorized, "authentication_error",
-			"Missing API key. Send in Authorization: Bearer <key> or x-api-key header", 0)
+		writeMissingAPIKey(w, openaiErrors{})
 		return
 	}
 

@@ -1,12 +1,17 @@
 package masq
 
 import (
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestFakeProjectSlug_HexHead(t *testing.T) {
@@ -139,4 +144,115 @@ func TestStateStore_PersistAcrossReload(t *testing.T) {
 	if strings.Contains(string(raw), "user_abc123") {
 		t.Error("plaintext api key must never be persisted")
 	}
+}
+
+// ---------- Upstream：/provider/v1/models 缓存按 key 隔离（F28） ----------
+
+// fakeModelsUpstream 按 Authorization 里的 key 返回不同列表，并记录每个 key 的调用次数。
+type fakeModelsUpstream struct {
+	mu    sync.Mutex
+	calls map[string]int
+	srv   *httptest.Server
+}
+
+func newFakeModelsUpstream(t *testing.T) *fakeModelsUpstream {
+	t.Helper()
+	f := &fakeModelsUpstream{calls: map[string]int{}}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/provider/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		f.mu.Lock()
+		f.calls[key]++
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"data":[{"id":"model-for-%s"}]}`, key)
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeModelsUpstream) callsFor(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls[key]
+}
+
+func newTestUpstream(t *testing.T, base string, ttl time.Duration) *Upstream {
+	t.Helper()
+	return NewUpstream(base, false, ttl, LoadState(filepath.Join(t.TempDir(), "state.json")), NewCCVersion())
+}
+
+// TestUpstream_ModelsCacheIsPerKey models 缓存曾是 Upstream 单例上的一个共享字段：
+// 被某个 key 填充后，无 key 请求与其它 key 在 TTL 内都会命中它（串号）。
+// 缓存改为按 key 分开存后，每个 key 只拿自己的列表，无 key 恒为兜底列表。
+func TestUpstream_ModelsCacheIsPerKey(t *testing.T) {
+	f := newFakeModelsUpstream(t)
+	u := newTestUpstream(t, f.srv.URL, time.Minute)
+
+	a := u.Models("user_key_a")
+	if len(a) != 1 || a[0].ID != "model-for-user_key_a" {
+		t.Fatalf("key A list = %v", a)
+	}
+	if b := u.Models("user_key_b"); len(b) != 1 || b[0].ID != "model-for-user_key_b" {
+		t.Fatalf("key B must not reuse key A's cache, got %v", b)
+	}
+	if got := u.Models(""); !reflect.DeepEqual(got, FallbackModels) {
+		t.Fatalf("no-key must return the fallback list, got %v", got)
+	}
+	// 同一 key 在 TTL 内仍命中缓存（行为不变）
+	if got := u.Models("user_key_a"); len(got) != 1 || got[0].ID != "model-for-user_key_a" {
+		t.Fatalf("key A second call = %v", got)
+	}
+	for _, key := range []string{"user_key_a", "user_key_b"} {
+		if n := f.callsFor(key); n != 1 {
+			t.Errorf("%s upstream calls = %d, want 1 (TTL 内应命中缓存)", key, n)
+		}
+	}
+	if n := f.callsFor(""); n != 0 {
+		t.Errorf("no-key request must not reach upstream, calls = %d", n)
+	}
+}
+
+// TestUpstream_ModelsCacheExpiresPerKey TTL 过期后同一 key 重新拉取（TTL 语义不变）。
+func TestUpstream_ModelsCacheExpiresPerKey(t *testing.T) {
+	f := newFakeModelsUpstream(t)
+	u := newTestUpstream(t, f.srv.URL, 20*time.Millisecond)
+
+	u.Models("user_key_a")
+	time.Sleep(60 * time.Millisecond)
+	if got := u.Models("user_key_a"); len(got) != 1 || got[0].ID != "model-for-user_key_a" {
+		t.Fatalf("after TTL = %v", got)
+	}
+	if n := f.callsFor("user_key_a"); n != 2 {
+		t.Errorf("upstream calls = %d, want 2 (TTL 过期后应重拉)", n)
+	}
+}
+
+// TestUpstream_ModelsCacheConcurrent 并发读写下按 key 隔离且无数据竞争（-race 下有效）。
+func TestUpstream_ModelsCacheConcurrent(t *testing.T) {
+	f := newFakeModelsUpstream(t)
+	u := newTestUpstream(t, f.srv.URL, time.Minute)
+
+	keys := []string{"user_key_a", "user_key_b", "", "user_key_c"}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			got := u.Models(key)
+			if key == "" {
+				if !reflect.DeepEqual(got, FallbackModels) {
+					t.Errorf("no-key must return the fallback list, got %v", got)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].ID != "model-for-"+key {
+				t.Errorf("key %q list = %v", key, got)
+			}
+		}(keys[i%len(keys)])
+	}
+	wg.Wait()
 }

@@ -31,8 +31,9 @@
 ## 三、 关键设计决策（核心不变式，勿轻易回退）
 
 1. **鉴权机制与兼容性**：
-   - 客户端鉴权头兼容 `Authorization: Bearer user_xxx` 与 `x-api-key: user_xxx`。
-   - 鉴权 key（cmdc 格式通常为 `user_xxx`）原样透传给上游，代理本身不校验 key 的合法性。
+   - 客户端鉴权头兼容 `Authorization: Bearer <key>` 与 `x-api-key: <key>`，取到的 key **原样透传上游**。
+   - **代理本身不校验 key 的合法性**：`getAPIKey` 只做提取（`Bearer ` 之后的 token、`x-api-key` 原值，各自 TrimSpace），**不做前缀校验**（不再按 `user_` 正则过滤）。依据：上游未来可能改用别的 key 形态（如 `sk-` 开头），本地按前缀过滤会把「发了但格式不对」误报成「没发 key」；非法/未知形态的 key 一律送上游，由上游报错并原路返回客户端。
+   - 只有确实**没发** key（两个头都取不到）时才本地 401，文案提示期望的 cmdc key 形状（`user_` 前缀）。该文案与状态码/错误类型在 `missingAPIKeyMessage` + `writeMissingAPIKey` 一处定义，三端点（messages/chat/responses）共用，防三份漂移。
    - 明文 API Key 严禁写入日志或持久化磁盘（`data/state.json` 中仅以 `sha256(key)` 前缀为索引）。
 2. **单跳直转与星形拓扑**：客户端协议 → 规范格式（`types.Request`，Anthropic Messages 形状）→ cmdc 信封一步完成，**坚决不引入任何中间层**（含 OpenAI Chat），避免字段与类型丢失。Anthropic Messages 是一等公民与内部规范格式：`/v1/responses`（面向 Codex CLI）与 `/v1/chat/completions` 的入站归一化（`translate/respin.go` / `chatin.go`）插在 `BuildCcRequest` **之前**，会话亲和、缓存断点合成、伪装全部免费继承；出站协议差异全部收敛在 `types.StreamEvent` **之后**（`translate/respout.go` / `chatout.go`，与 `Aggregator` 同层；server 侧经 `pipeline.go` 的 `EventEncoder`/`EventAggregator`/`ErrorWriter` 三接口注入），`StreamTranslator` 与 `masq` 包对入站协议零感知。
 3. **Responses/Chat 出站硬约束**（2026-09-17 定案，违反会破坏严格客户端尤其是 Codex）：
@@ -55,6 +56,11 @@
    - Anthropic 入站：`stop_sequences`、`top_k`、`metadata.user_id`、`tool_result.is_error`。
    - Responses/Chat 入站追加：`truncation`、`include`、`background`、`service_tier`、`prompt_cache_key`、`safety_identifier`、`user`、`metadata`、`text`（format/verbosity）、`top_logprobs`、`stream_options`、`logprobs`、`response_format`/`text.format`（结构化输出，安全丢弃不转换）；Chat 追加 `stop`（不映射、不落 `out.StopSequences`）、`frequency_penalty`、`presence_penalty`、`logit_bias`、`store`、`prediction`、`extra_body`（无类型字段由 `types.ChatIgnoredFields(raw)` 探测存在性后留痕）；Chat 的 `n>1` 直接 400。
    - `reasoning.encrypted_content` 丢弃**不留痕**（Codex 每轮必发，留痕会淹没日志）。
+   - Anthropic 原生入站的**降级 / 钳制**（文案自带「哪个工具·哪个字段 + 我们做了什么 + 后果」，且**同一请求内聚合为一条**，避免长对话刷屏）：
+     - 工具 `input_schema` 非 object（顶层 `anyOf`/`oneOf`、`type` 缺失或非 `"object"`、非法 JSON）→ 整体替换为 `{"type":"object","properties":{}}`（保守行为，**不改为透传**：透传 `anyOf` 无任何一级证据，而 MCP 工具联合 schema 被拒会使整轮 400）；
+     - `tool_choice` 未知 `type` → 降级为 `auto`；`{type:"tool"}` 缺 `name` → 原样发出无名 `{"type":"tool"}`（这两个静默分支**仅 Anthropic 原生入站可达**：Chat/Responses 在各自预归一层已留痕）；
+     - `max_tokens > 200000` → 钳制到 200000（**上限保留**，不提高、不改为纯透传）。
+   - **绝不覆写**（非丢弃项，登记于此以防文档与代码互相矛盾）：客户端 part 级 `cache_control`（含 `ttl`）**原样透传**，仅当 `type` 缺失时补 `"ephemeral"`，**无 ttl 时不合成 ttl**——cmdc 之下还有它自己的上游（deepseek 等默认 24h 缓存），覆写 ttl 会真的拉低其默认缓存时长（见 `types.CacheControl` 注释）。
    - 所有丢弃必须留痕（`info:` 前缀为良性观测，其余 warn），两条入站路径口径一致（空 tool_result 归一化为 `""`、effort 档位收窄 `minimal→low`、`xhigh/max→high`）。
 7. **客户端伪装自洽性**：
    - 指纹/Lifecycle/信封 Environment/WorkingDir 全套对齐 Windows x64。

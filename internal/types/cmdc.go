@@ -46,7 +46,9 @@ type CcMessage struct {
 }
 
 // CcPart cmdc content part 并集：text / image / tool-call / tool-result
-// /（实验性）reasoning。cache_control 为 PR#10 验证过的缓存标记。
+// /（实验性）reasoning。cache_control 为 Anthropic 形状的缓存断点标记，
+// 形状依据是 A 级参照（proxy.mjs:472-476 写入 {type:"ephemeral"}）；
+// 客户端标记（含 ttl）原样透传，不覆写、不合成 —— 依据见 CacheControl 注释。
 type CcPart struct {
 	Type         string          `json:"type"`
 	Text         string          `json:"text,omitempty"`

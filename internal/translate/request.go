@@ -117,6 +117,11 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		maxTokens = 64000
 	}
 	if maxTokens > 200000 {
+		// 上限保留（不提高、不改为纯透传）：钳制静默发生会让客户端以为请求的
+		// max_tokens 生效，故必须留痕，附请求值与钳制后的值。
+		warns = append(warns, fmt.Sprintf(
+			"max_tokens %d exceeds the 200000 ceiling of the cmdc envelope and was clamped to 200000; the model will stop earlier than the client asked for. (The ceiling mirrors the reference client: reference/commandcode-proxy/proxy.mjs:500 Math.min(max_tokens || 64000, 200000); it has no upstream error receipt, so treat a hit here as a signal worth reporting.)",
+			req.MaxTokens))
 		maxTokens = 200000
 	}
 
@@ -151,7 +156,7 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 	if len(tools) > 0 {
 		cc.Params.Tools = tools
 	}
-	if tc, parallel := convertToolChoice(req.ToolChoice); tc != nil {
+	if tc, parallel := convertToolChoice(req.ToolChoice, &warns); tc != nil {
 		cc.Params.ToolChoice = tc
 		cc.Params.ParallelToolCalls = parallel
 	}
@@ -447,12 +452,18 @@ func toolResultContent(raw json.RawMessage, warns *[]string) (string, []string) 
 	return strings.Join(texts, "\n\n"), images
 }
 
-// ccCC 归一化 cache_control：只保留已验证的 {type:"ephemeral"} 形状（剥 TTL）。
+// ccCC 原样保留客户端 part 级 cache_control（含 ttl），仅在 type 缺失时补 "ephemeral"。
+// 绝不覆写、绝不合成 ttl：cmdc 之下还有它自己的上游（deepseek/qwen/anthropic/gpt 等），
+// 覆写 ttl（例如统一成 1h）会真的拉低下游 provider 的默认缓存时长。详见 types.CacheControl 注释。
 func ccCC(cc *types.CacheControl) *types.CacheControl {
 	if cc == nil {
 		return nil
 	}
-	return &types.CacheControl{Type: "ephemeral"}
+	out := *cc
+	if out.Type == "" {
+		out.Type = "ephemeral"
+	}
+	return &out
 }
 
 // ---------- tools / tool_choice / thinking ----------
@@ -462,43 +473,64 @@ func convertTools(tools []types.Tool, warns *[]string) ([]types.CcTool, bool) {
 		return nil, false
 	}
 	out := make([]types.CcTool, 0, len(tools))
+	var replaced []string // 说明书被整体清空的工具名，按请求聚合成一条留痕
 	hadCC := false
 	for _, t := range tools {
 		hadCC = hadCC || t.CacheControl != nil
+		schema, wasReplaced := normalizeSchemaReport(t.InputSchema)
+		if wasReplaced {
+			replaced = append(replaced, t.Name)
+		}
 		out = append(out, types.CcTool{
 			Type:        "function",
 			Name:        t.Name,
 			Description: t.Description,
-			InputSchema: normalizeSchema(t.InputSchema),
+			InputSchema: schema,
 		})
+	}
+	if len(replaced) > 0 {
+		*warns = append(*warns, fmt.Sprintf(
+			"tool input_schema replaced with {\"type\":\"object\",\"properties\":{}} for %d tool(s) [%s]: the cmdc envelope requires input_schema to be an object and these were not (top-level anyOf/oneOf, \"type\" missing or not \"object\", or invalid JSON). The model now sees them as parameterless tools, so their calls may arrive with empty or missing arguments — if one of them is affected and you need its real parameters, check the client-side tool declaration.",
+			len(replaced), strings.Join(replaced, ", ")))
 	}
 	return out, hadCC
 }
 
-// normalizeSchema 规范化工具 input_schema：确保为合法 object 且包含 properties 字段，防止上游 400 校验错误。
+// normalizeSchema 规范化工具 input_schema（仅形状、不留痕）：
+// 确保为合法 object 且包含 properties 字段，防止上游 400 校验错误。
+// respin.go 的工具声明与去重键比较使用本入口；需要留痕的入站漏斗请用 normalizeSchemaReport。
 func normalizeSchema(raw json.RawMessage) json.RawMessage {
+	out, _ := normalizeSchemaReport(raw)
+	return out
+}
+
+// normalizeSchemaReport 与 normalizeSchema 同实现，另返回「是否发生了替换」，
+// 供 convertTools 按请求聚合成一条留痕（见其调用点文案）。
+// 替换为有意保留的保守行为：透传顶层 anyOf/oneOf 无任何一级证据，而 MCP 工具的
+// 联合 schema 一旦被上游拒绝会使整轮 400 —— 失败方向更糟。
+func normalizeSchemaReport(raw json.RawMessage) (json.RawMessage, bool) {
 	def := json.RawMessage(`{"type":"object","properties":{}}`)
 	if len(raw) == 0 {
-		return def
+		return def, true
 	}
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil || m == nil {
-		return def
+		return def, true
 	}
 	if t, ok := m["type"]; !ok || strings.TrimSpace(string(t)) != `"object"` {
-		return def
+		return def, true
 	}
 	if _, ok := m["properties"]; !ok {
 		m["properties"] = json.RawMessage(`{}`)
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
-		return def
+		return def, true
 	}
-	return b
+	return b, false
 }
 
-func convertToolChoice(raw json.RawMessage) (*types.CcToolChoice, *bool) {
+func convertToolChoice(raw json.RawMessage, warns *[]string) (*types.CcToolChoice, *bool) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -513,8 +545,14 @@ func convertToolChoice(raw json.RawMessage) (*types.CcToolChoice, *bool) {
 	var choice *types.CcToolChoice
 	switch tc.Type {
 	case "auto", "any", "tool", "none":
+		if tc.Type == "tool" && tc.Name == "" {
+			*warns = append(*warns, `tool_choice {"type":"tool"} carries no "name": it was forwarded to the cmdc upstream as a nameless {"type":"tool"}, which cannot resolve to any tool — expect either a validation error from upstream or the model calling an arbitrary tool. The Anthropic Messages API requires the tool name when type is "tool". (This shape can only reach the envelope from the Anthropic Messages inbound path: /v1/chat/completions and /v1/responses resolve tool_choice in their own inbound layer and fall back to auto with a warning when the name is missing.)`)
+		}
 		choice = &types.CcToolChoice{Type: tc.Type, Name: tc.Name}
 	default:
+		*warns = append(*warns, fmt.Sprintf(
+			"tool_choice type %q is not one of auto/any/tool/none: it was downgraded to {\"type\":\"auto\"}, so the model may now call any tool (or none) instead of being constrained as the client asked. (This silent downgrade is reachable only from the Anthropic Messages inbound path; /v1/chat/completions and /v1/responses normalize tool_choice in their own inbound layer and already log the unknown value there.)",
+			tc.Type))
 		choice = &types.CcToolChoice{Type: "auto"}
 	}
 	var parallel *bool

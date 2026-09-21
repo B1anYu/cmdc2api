@@ -30,9 +30,16 @@ type Upstream struct {
 	initMu   sync.Mutex
 	inflight map[string]bool // 每 key 预请求去重
 
+	// modelsCache 按 apiKey 分开存：不同 key 的可见模型集可能不同（且无 key 走兜底列表），
+	// 共用一份会让无 key / 其它 key 的请求命中别的 key 拉回来的列表。
 	modelsMu    sync.Mutex
-	modelsCache []Model
-	modelsAt    time.Time
+	modelsCache map[string]cachedModels
+}
+
+// cachedModels 单个 key 的模型列表缓存条目。
+type cachedModels struct {
+	models []Model
+	at     time.Time
 }
 
 // Model 上游模型条目。
@@ -52,14 +59,15 @@ func NewUpstream(base string, zdr bool, modelsTTL time.Duration, state *StateSto
 		MaxIdleConnsPerHost:  4,
 	}
 	return &Upstream{
-		base:      strings.TrimRight(base, "/"),
-		zdr:       zdr,
-		state:     state,
-		versions:  ver,
-		client:    &http.Client{Transport: transport},
-		fast:      &http.Client{Timeout: 10 * time.Second, Transport: transport.Clone()},
-		modelsTTL: modelsTTL,
-		inflight:  make(map[string]bool),
+		base:        strings.TrimRight(base, "/"),
+		zdr:         zdr,
+		state:       state,
+		versions:    ver,
+		client:      &http.Client{Transport: transport},
+		fast:        &http.Client{Timeout: 10 * time.Second, Transport: transport.Clone()},
+		modelsTTL:   modelsTTL,
+		inflight:    make(map[string]bool),
+		modelsCache: make(map[string]cachedModels),
 	}
 }
 
@@ -169,13 +177,13 @@ func (u *Upstream) Generate(ctx context.Context, apiKey, session string, inbound
 	return u.client.Do(req)
 }
 
-// Models 拉取上游模型列表（带 TTL 内存缓存），请求失败时回退至内置兜底列表。
+// Models 拉取上游模型列表（按 apiKey 分别做 TTL 内存缓存），请求失败时回退至内置兜底列表。
+// 无 key 恒返回兜底列表且不触上游（也不占用缓存）。
 func (u *Upstream) Models(apiKey string) []Model {
 	u.modelsMu.Lock()
-	if u.modelsCache != nil && time.Since(u.modelsAt) < u.modelsTTL {
-		c := u.modelsCache
+	if c, ok := u.modelsCache[apiKey]; ok && time.Since(c.at) < u.modelsTTL {
 		u.modelsMu.Unlock()
-		return c
+		return c.models
 	}
 	u.modelsMu.Unlock()
 
@@ -210,8 +218,7 @@ func (u *Upstream) Models(apiKey string) []Model {
 		models = append(models, Model{ID: m.ID, Name: m.ID})
 	}
 	u.modelsMu.Lock()
-	u.modelsCache = models
-	u.modelsAt = time.Now()
+	u.modelsCache[apiKey] = cachedModels{models: models, at: time.Now()}
 	u.modelsMu.Unlock()
 	slog.Info("fetched models from provider", "count", len(models))
 	return models

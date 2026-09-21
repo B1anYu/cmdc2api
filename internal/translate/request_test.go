@@ -75,7 +75,8 @@ func TestBuildCcRequest_SystemArrayToStringAndCacheMarker(t *testing.T) {
 	}
 }
 
-func TestBuildCcRequest_PartLevelCacheControlKeptTTlStripped(t *testing.T) {
+// F3：客户端 part 级 cache_control 的 ttl 必须原样到达出站信封（绝不覆写、绝不合成）。
+func TestBuildCcRequest_CacheControlTTLPreservedVerbatim(t *testing.T) {
 	req := parseReq(t, `{
 		"max_tokens": 10,
 		"messages": [{"role": "user", "content": [
@@ -85,12 +86,42 @@ func TestBuildCcRequest_PartLevelCacheControlKeptTTlStripped(t *testing.T) {
 	}`)
 	cc, _ := BuildCcRequest(req, testOpts())
 	part := cc.Params.Messages[0].Content[1]
-	if part.CacheControl == nil || part.CacheControl.Type != "ephemeral" {
-		t.Errorf("cache_control lost: %+v", part)
+	if part.CacheControl == nil || part.CacheControl.Type != "ephemeral" || part.CacheControl.TTL != "1h" {
+		t.Fatalf("ttl must survive verbatim into the envelope: %+v", part.CacheControl)
 	}
 	b, _ := json.Marshal(part.CacheControl)
-	if string(b) != `{"type":"ephemeral"}` {
-		t.Errorf("cache_control should be normalized to {type:ephemeral}, got %s", b)
+	if string(b) != `{"type":"ephemeral","ttl":"1h"}` {
+		t.Errorf("cache_control wire shape = %s, want {\"type\":\"ephemeral\",\"ttl\":\"1h\"}", b)
+	}
+	// 端到端：整个信封的线格式里 ttl 必须原样出现（F3 审计的出站构造点覆盖）
+	whole, err := json.Marshal(cc)
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	if !strings.Contains(string(whole), `"cache_control":{"type":"ephemeral","ttl":"1h"}`) {
+		t.Errorf("ttl missing from serialized envelope: %s", whole)
+	}
+}
+
+// F3：没有 ttl 时不注入 ttl（不合成）；type 缺失时补 "ephemeral"。
+func TestBuildCcRequest_CacheControlNoTTLSynthesized(t *testing.T) {
+	req := parseReq(t, `{
+		"max_tokens": 10,
+		"messages": [{"role": "user", "content": [
+			{"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+			{"type": "text", "text": "b", "cache_control": {}}
+		]}]
+	}`)
+	cc, _ := BuildCcRequest(req, testOpts())
+	for i, want := range []string{`{"type":"ephemeral"}`, `{"type":"ephemeral"}`} {
+		part := cc.Params.Messages[0].Content[i]
+		if part.CacheControl == nil {
+			t.Fatalf("part %d lost its cache_control: %+v", i, part)
+		}
+		b, _ := json.Marshal(part.CacheControl)
+		if string(b) != want {
+			t.Errorf("part %d cache_control = %s, want %s (ttl must NOT be added)", i, b, want)
+		}
 	}
 }
 
@@ -252,6 +283,51 @@ func TestBuildCcRequest_ToolChoiceAndParallel(t *testing.T) {
 	}
 }
 
+// F2：未知 tool_choice type 静默降级为 auto 时必须留痕（该分支仅 Anthropic 原生入站可达）。
+func TestBuildCcRequest_ToolChoiceUnknownTypeWarned(t *testing.T) {
+	req := parseReq(t, `{"max_tokens": 10, "tool_choice": {"type": "weird"},
+		"messages": [{"role": "user", "content": "hi"}]}`)
+	cc, warns := BuildCcRequest(req, testOpts())
+	if tc := cc.Params.ToolChoice; tc == nil || tc.Type != "auto" {
+		t.Fatalf("unknown tool_choice must still fall back to auto: %+v", cc.Params.ToolChoice)
+	}
+	w := warnContaining(t, warns, `tool_choice type "weird"`)
+	if !strings.Contains(w, `{"type":"auto"}`) || !strings.Contains(w, "any tool") {
+		t.Errorf("warn must say what we did and what it means for the model, got %q", w)
+	}
+	if !strings.Contains(w, "Anthropic Messages inbound path") {
+		t.Errorf("warn must scope the branch to the Anthropic-native inbound path, got %q", w)
+	}
+}
+
+// F2：{type:"tool"} 缺 name 会产出无名 {"type":"tool"}，必须留痕。
+func TestBuildCcRequest_ToolChoiceToolWithoutNameWarned(t *testing.T) {
+	req := parseReq(t, `{"max_tokens": 10, "tool_choice": {"type": "tool"},
+		"messages": [{"role": "user", "content": "hi"}]}`)
+	cc, warns := BuildCcRequest(req, testOpts())
+	tc := cc.Params.ToolChoice
+	if tc == nil || tc.Type != "tool" || tc.Name != "" {
+		t.Fatalf("behavior unchanged: want nameless {type:tool}, got %+v", tc)
+	}
+	b, _ := json.Marshal(tc)
+	if string(b) != `{"type":"tool"}` {
+		t.Errorf("wire shape = %s, want {\"type\":\"tool\"} (omitempty drops the empty name)", b)
+	}
+	w := warnContaining(t, warns, `tool_choice {"type":"tool"} carries no "name"`)
+	if !strings.Contains(w, "cannot resolve to any tool") {
+		t.Errorf("warn must state the consequence, got %q", w)
+	}
+	// 带 name 的同一形态不得留痕（避免 over-warn）
+	named := parseReq(t, `{"max_tokens": 10, "tool_choice": {"type": "tool", "name": "f"},
+		"messages": [{"role": "user", "content": "hi"}]}`)
+	_, namedWarns := BuildCcRequest(named, testOpts())
+	for _, w := range namedWarns {
+		if strings.Contains(w, "tool_choice") {
+			t.Errorf("valid tool_choice must not warn, got %q", w)
+		}
+	}
+}
+
 func TestBuildCcRequest_MaxTokensClamp(t *testing.T) {
 	cases := []struct {
 		in   int
@@ -262,6 +338,30 @@ func TestBuildCcRequest_MaxTokensClamp(t *testing.T) {
 		cc, _ := BuildCcRequest(req, testOpts())
 		if cc.Params.MaxTokens != c.want {
 			t.Errorf("max_tokens %d → %d, want %d", c.in, cc.Params.MaxTokens, c.want)
+		}
+	}
+}
+
+// F4：200000 上限保留（不提高、不改为透传），但触发钳制时必须留痕，附请求值与钳制后的值。
+func TestBuildCcRequest_MaxTokensClampWarned(t *testing.T) {
+	req := parseReq(t, `{"max_tokens": 300000, "messages": [{"role":"user","content":"hi"}]}`)
+	cc, warns := BuildCcRequest(req, testOpts())
+	if cc.Params.MaxTokens != 200000 {
+		t.Fatalf("ceiling must be kept: max_tokens = %d, want 200000", cc.Params.MaxTokens)
+	}
+	w := warnContaining(t, warns, "max_tokens 300000")
+	if !strings.Contains(w, "clamped to 200000") {
+		t.Errorf("warn must carry the clamped value, got %q", w)
+	}
+	if !strings.Contains(w, "earlier than the client asked for") {
+		t.Errorf("warn must state the consequence, got %q", w)
+	}
+	// 未超过上限时不产生该 warn
+	ok := parseReq(t, `{"max_tokens": 5000, "messages": [{"role":"user","content":"hi"}]}`)
+	_, okWarns := BuildCcRequest(ok, testOpts())
+	for _, w := range okWarns {
+		if strings.Contains(w, "clamped to 200000") {
+			t.Errorf("no clamp happened, but warn fired: %q", w)
 		}
 	}
 }
@@ -329,7 +429,7 @@ func TestBuildCcRequest_ToolSchemaNormalized(t *testing.T) {
 			{"name": "c", "input_schema": {"type": "string"}}
 		],
 		"messages": [{"role":"user","content":"hi"}]}`)
-	cc, _ := BuildCcRequest(req, testOpts())
+	cc, warns := BuildCcRequest(req, testOpts())
 	for i, tool := range cc.Params.Tools {
 		var schema map[string]any
 		if err := json.Unmarshal(tool.InputSchema, &schema); err != nil {
@@ -344,6 +444,64 @@ func TestBuildCcRequest_ToolSchemaNormalized(t *testing.T) {
 		if tool.Type != "function" {
 			t.Errorf("tool %d type = %s", i, tool.Type)
 		}
+	}
+	// tools b（无 schema）与 c（type:string）被替换 → 必须留痕
+	w := warnContaining(t, warns, "input_schema replaced with")
+	if !strings.Contains(w, "2 tool(s)") || !strings.Contains(w, "b, c") {
+		t.Errorf("replace warn must name the affected tools, got %q", w)
+	}
+}
+
+// F1：顶层 anyOf 的工具 schema 仍被整体替换（保守行为已亲批、不改为透传），但必须留痕。
+func TestBuildCcRequest_NonObjectSchemaReplacedWithWarn(t *testing.T) {
+	req := parseReq(t, `{"max_tokens": 10,
+		"tools": [
+			{"name": "union_tool", "input_schema": {"anyOf": [{"type":"object"},{"type":"string"}]}},
+			{"name": "ok_tool", "input_schema": {"type": "object", "properties": {"x": {"type": "string"}}}}
+		],
+		"messages": [{"role":"user","content":"hi"}]}`)
+	cc, warns := BuildCcRequest(req, testOpts())
+	if got := string(cc.Params.Tools[0].InputSchema); got != `{"type":"object","properties":{}}` {
+		t.Errorf("non-object schema must still be replaced (behavior unchanged): %s", got)
+	}
+	if got := string(cc.Params.Tools[1].InputSchema); !strings.Contains(got, `"x"`) {
+		t.Errorf("object schema must pass through untouched: %s", got)
+	}
+	w := warnContaining(t, warns, "input_schema replaced with")
+	if !strings.Contains(w, "1 tool(s)") || !strings.Contains(w, "union_tool") {
+		t.Errorf("warn must carry the affected tool name and count, got %q", w)
+	}
+	if strings.Contains(w, "ok_tool") {
+		t.Errorf("warn must not name untouched tools, got %q", w)
+	}
+	if !strings.Contains(w, "anyOf") || !strings.Contains(w, "parameterless") {
+		t.Errorf("warn must state what was lost and the consequence, got %q", w)
+	}
+}
+
+// F1 + A′2：同一请求内多个工具的说明书被清空时聚合为一条 warn（避免长对话刷屏）。
+func TestBuildCcRequest_NonObjectSchemaWarnAggregatedPerRequest(t *testing.T) {
+	req := parseReq(t, `{"max_tokens": 10,
+		"tools": [
+			{"name": "t_a", "input_schema": {"type": "string"}},
+			{"name": "t_b"},
+			{"name": "t_c", "input_schema": {"oneOf": [{"type":"object"}]}}
+		],
+		"messages": [{"role":"user","content":"hi"}]}`)
+	_, warns := BuildCcRequest(req, testOpts())
+	n := 0
+	agg := ""
+	for _, w := range warns {
+		if strings.Contains(w, "input_schema replaced with") {
+			n++
+			agg = w
+		}
+	}
+	if n != 1 {
+		t.Fatalf("warn must be aggregated into a single line per request, got %d: %v", n, warns)
+	}
+	if !strings.Contains(agg, "3 tool(s)") || !strings.Contains(agg, "t_a, t_b, t_c") {
+		t.Errorf("aggregated warn must list every affected tool, got %q", agg)
 	}
 }
 
@@ -497,5 +655,17 @@ func TestPrefixCacheKey_StableWithinConversation(t *testing.T) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// warnContaining 返回第一条含 sub 的留痕；缺失即测试失败（新留痕用例一律正向钉住出现）。
+func warnContaining(t *testing.T, warns []string, sub string) string {
+	t.Helper()
+	for _, w := range warns {
+		if strings.Contains(w, sub) {
+			return w
+		}
+	}
+	t.Fatalf("no warning containing %q; got %v", sub, warns)
+	return ""
+}
 
 func boolPtr(b bool) *bool { return &b }

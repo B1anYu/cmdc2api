@@ -41,9 +41,14 @@ type Metadata struct {
 }
 
 // CacheControl Anthropic 与 cmdc part 共用的缓存断点标记。
-// 上游已验证的形状只有 {type:"ephemeral"}，TTL 一律剥掉。
+// 形状依据：{type:"ephemeral"} 有 A 级出处（reference/commandcode-proxy/proxy.mjs:472-476
+// 由参照客户端写入该形状，证明上游接受它）。ttl 是否被上游接受**未验证**：本项目**有意
+// 原样透传、绝不覆写、绝不合成**。理由：cmdc 之下还有它自己的上游（deepseek/qwen/anthropic/gpt
+// 等），覆写 ttl（例如统一成 1h）会拉低下游 provider 的默认缓存时长 —— 实测不带 ttl 时
+// deepseek 侧缓存时长为 24h，覆写 1h 会让它真的只保留 1h。
 type CacheControl struct {
 	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
 }
 
 // Block 入站 content 块的并集（text/image/thinking/tool_use/tool_result/...）。

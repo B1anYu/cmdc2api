@@ -18,12 +18,13 @@ import (
 
 // newFakeCC 模拟 cmdc 上游：记录收到的请求，按脚本回 NDJSON。
 type fakeCC struct {
-	mu      sync.Mutex
-	script  []string
-	status  int // 非 0 时 /alpha/generate 返回该状态码
-	errBody string
-	inits   int
-	genReqs []capturedGen
+	mu         sync.Mutex
+	script     []string
+	status     int // 非 0 时 /alpha/generate 返回该状态码
+	errBody    string
+	inits      int
+	modelsHits int // /provider/v1/models 被真实请求的次数（缓存隔离断言用）
+	genReqs    []capturedGen
 }
 
 type capturedGen struct {
@@ -90,7 +91,16 @@ func (f *fakeCC) serve(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/alpha/lifecycle-events" && r.Method == "POST":
 		w.WriteHeader(http.StatusOK)
 	case r.URL.Path == "/provider/v1/models" && r.Method == "GET":
+		f.mu.Lock()
+		f.modelsHits++
+		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		// 按 key 返回不同列表：/v1/models 的缓存必须按 key 隔离（F28），
+		// 否则后一个 key（或无 key 请求）会拿到前一个 key 拉回来的列表。
+		if strings.HasSuffix(r.Header.Get("Authorization"), "user_keyb") {
+			_, _ = w.Write([]byte(`{"data":[{"id":"provider/model-b"}]}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"data":[{"id":"provider/model-x"}]}`))
 	case r.URL.Path == "/alpha/generate" && r.Method == "POST":
 		body, _ := io.ReadAll(r.Body)
@@ -337,24 +347,30 @@ func TestEndToEnd_AuthAndValidation(t *testing.T) {
 	f := newFakeCC(t)
 	proxy := newProxy(t, f, nil)
 
-	// 401：缺 key
+	// 401：缺 key（文案点明期望的 key 形状，见 missingAPIKeyMessage）
 	resp := postMessages(t, proxy, anthropicReq, nil)
-	_ = resp.Body.Close()
+	body := readAll(t, resp)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("no key: status = %d, want 401", resp.StatusCode)
 	}
-	// 401：非 user_ key
+	if !strings.Contains(body, "user_") {
+		t.Errorf("401 message must hint the user_ key shape: %s", body)
+	}
+	// 非 user_ 形态的 key 不再被本地拒绝：代理不校验 key 合法性，原样透传上游，
+	// 由上游判定并把错误原路返回（F26）。断言见 TestEndToEnd_NonUserKeyPassedThrough。
 	resp = postMessages(t, proxy, anthropicReq, map[string]string{"x-api-key": "sk-bad"})
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("bad key: status = %d, want 401", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("non-user key: status = %d, want 200 (透传上游)", resp.StatusCode)
 	}
-	// 400：坏 JSON
+	// 400：坏 JSON（Anthropic 端点 → Anthropic 形状；OpenAI 端点侧见
+	// TestChatCompletions_ReadBodyErrorsUseOpenAIShape / TestResponses_ReadBodyErrorsUseOpenAIShape）
 	resp = postMessages(t, proxy, `{not json`, map[string]string{"x-api-key": "user_test123"})
-	_ = resp.Body.Close()
+	body = readAll(t, resp)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("bad json: status = %d, want 400", resp.StatusCode)
 	}
+	assertAnthropicError(t, decodeJSON(t, body), "invalid_request_error", "Invalid JSON body")
 	// 400：空 messages
 	resp = postMessages(t, proxy, `{"model":"m","messages":[]}`, map[string]string{"x-api-key": "user_test123"})
 	_ = resp.Body.Close()
@@ -364,10 +380,11 @@ func TestEndToEnd_AuthAndValidation(t *testing.T) {
 	// 413：超限（MaxBodyBytes 压到 1KB）
 	small := newProxy(t, f, func(c *config.Config) { c.MaxBodyBytes = 1024 })
 	resp = postMessages(t, small, anthropicReq+strings.Repeat(" ", 4096), map[string]string{"x-api-key": "user_test123"})
-	_ = resp.Body.Close()
+	body = readAll(t, resp)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversize: status = %d, want 413", resp.StatusCode)
 	}
+	assertAnthropicError(t, decodeJSON(t, body), "invalid_request_error", "exceeds")
 	// 404：未知路径
 	resp2, _ := http.Get(proxy.URL + "/v1/unknown")
 	_ = resp2.Body.Close()
@@ -510,5 +527,202 @@ func TestEndToEnd_NotFoundShapeByPath(t *testing.T) {
 				t.Errorf("message = %v", errObj["message"])
 			}
 		})
+	}
+}
+
+// ---------- 鉴权：不校验 key 形态（F26） ----------
+
+// assertAnthropicError 断言 Anthropic 形状错误体：顶层 "type":"error" + error.{type,message}。
+// OpenAI 形状无顶层 type（判定依据见 TestEndToEnd_NotFoundShapeByPath）。
+func assertAnthropicError(t *testing.T, body map[string]any, wantType, wantMsgSub string) {
+	t.Helper()
+	if got := mStr(t, body, "type"); got != "error" {
+		t.Errorf("top-level type = %q, want error (Anthropic shape)", got)
+	}
+	errObj := mMap(t, body, "error")
+	if got := mStr(t, errObj, "type"); got != wantType {
+		t.Errorf("error.type = %q, want %q", got, wantType)
+	}
+	if msg := mStr(t, errObj, "message"); !strings.Contains(msg, wantMsgSub) {
+		t.Errorf("error.message = %q, want substring %q", msg, wantMsgSub)
+	}
+	if _, ok := errObj["code"]; ok {
+		t.Errorf("Anthropic shape must not carry error.code: %v", errObj)
+	}
+}
+
+// postJSONPath 打任意端点路径（三端点仅路径不同，错误出口形状才是有差异的部分）。
+func postJSONPath(t *testing.T, proxy *httptest.Server, path, body string, headers map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, proxy.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := proxy.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// TestGetAPIKey_NoPrefixRestriction 代理不校验 key 的合法性（AGENTS.md §三.1）：
+// getAPIKey 只做「取 Bearer 之后的 token / 取 x-api-key 原值」的提取，不限制前缀形状。
+func TestGetAPIKey_NoPrefixRestriction(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		{"x-api-key user_", map[string]string{"x-api-key": "user_abc123"}, "user_abc123"},
+		{"x-api-key sk-", map[string]string{"x-api-key": "sk-abc123"}, "sk-abc123"},
+		{"x-api-key 原值去掉首尾空白", map[string]string{"x-api-key": "  sk-abc123  "}, "sk-abc123"},
+		{"bearer user_", map[string]string{"Authorization": "Bearer user_abc123"}, "user_abc123"},
+		{"bearer sk-", map[string]string{"Authorization": "Bearer sk-abc123"}, "sk-abc123"},
+		{"bearer token 去掉首尾空白", map[string]string{"Authorization": "Bearer   sk-abc123 "}, "sk-abc123"},
+		{"bearer 空 token 时回落到 x-api-key", map[string]string{"Authorization": "Bearer ", "x-api-key": "user_zzz"}, "user_zzz"},
+		{"非 Bearer 方案不当作 key", map[string]string{"Authorization": "Basic dXNlcg=="}, ""},
+		{"无鉴权头", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.Header{}
+			for k, v := range tc.headers {
+				h.Set(k, v)
+			}
+			if got := getAPIKey(h); got != tc.want {
+				t.Errorf("getAPIKey = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMissingAPIKeyMessageMentionsUserPrefix 401 只在确实没发 key 时触发，
+// 文案需点明期望的 cmdc key 形状（user_ 前缀），且三端点共用同一句（避免三份漂移）。
+func TestMissingAPIKeyMessageMentionsUserPrefix(t *testing.T) {
+	f := newFakeCC(t)
+	proxy := newProxy(t, f, nil)
+
+	cases := []struct{ name, path, body string }{
+		{"messages", "/v1/messages", anthropicReq},
+		{"chat", "/v1/chat/completions", chatRequestBody(false)},
+		{"responses", "/v1/responses", responsesBody(false, "")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := postJSONPath(t, proxy, tc.path, tc.body, nil)
+			body := readAll(t, resp)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401\nbody: %s", resp.StatusCode, body)
+			}
+			if !strings.Contains(body, "user_") {
+				t.Errorf("401 message must hint the user_ key shape: %s", body)
+			}
+			if !strings.Contains(body, "Missing API key") {
+				t.Errorf("401 message must keep the 'Missing API key' phrasing: %s", body)
+			}
+		})
+	}
+
+	// 未鉴权的请求不得触上游
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.genReqs) != 0 {
+		t.Errorf("unauthenticated requests must not reach upstream, got %d", len(f.genReqs))
+	}
+}
+
+// TestEndToEnd_NonUserKeyPassedThrough 非 user_ 形态的 key（如 sk-…）不做本地格式校验：
+// 必须原样透传给上游（上游会报 invalid api key，原路返回给客户端），
+// 而不是在本地被判成「没发 key」——那会把「格式不对」误报成「没发」。
+func TestEndToEnd_NonUserKeyPassedThrough(t *testing.T) {
+	cases := []struct {
+		name       string
+		headers    map[string]string
+		wantBearer string
+	}{
+		{"x-api-key", map[string]string{"x-api-key": "sk-test-key"}, "Bearer sk-test-key"},
+		{"authorization bearer", map[string]string{"Authorization": "Bearer sk-test-key"}, "Bearer sk-test-key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeCC(t)
+			proxy := newProxy(t, f, nil)
+
+			resp := postMessages(t, proxy, anthropicReq, tc.headers)
+			body := readAll(t, resp)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (key 应透传上游)\nbody: %s", resp.StatusCode, body)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if len(f.genReqs) != 1 {
+				t.Fatalf("generate calls = %d, want 1", len(f.genReqs))
+			}
+			if got := f.genReqs[0].headers.Get("Authorization"); got != tc.wantBearer {
+				t.Errorf("upstream Authorization = %q, want %q", got, tc.wantBearer)
+			}
+		})
+	}
+}
+
+// ---------- /v1/models 缓存按 key 隔离（F28） ----------
+
+// TestEndToEnd_ModelsCacheIsPerKey models 缓存曾挂在 Upstream 单例上（先填后串号）：
+// 先用 key A 拉取，再用无 key 与 key B 请求，都必须拿到各自该拿的列表，
+// 而不是 A 缓存里的那一份。
+func TestEndToEnd_ModelsCacheIsPerKey(t *testing.T) {
+	f := newFakeCC(t)
+	proxy := newProxy(t, f, nil)
+
+	fetch := func(t *testing.T, key string) string {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, proxy.URL+"/v1/models", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if key != "" {
+			req.Header.Set("x-api-key", key)
+		}
+		resp, err := proxy.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, body: %s", resp.StatusCode, body)
+		}
+		data := mList(t, decodeJSON(t, body), "data")
+		if len(data) == 0 {
+			t.Fatalf("data is empty: %s", body)
+		}
+		return mStr(t, data[0].(map[string]any), "id")
+	}
+
+	// key A 填充缓存
+	if got := fetch(t, "user_keya"); got != "provider/model-x" {
+		t.Fatalf("key A list = %q, want provider/model-x", got)
+	}
+	// 无 key：恒为兜底列表，不得命中 A 的缓存
+	if got := fetch(t, ""); got != "claude-sonnet-4-6" {
+		t.Errorf("无 key 请求拿到 %q，应为兜底列表（未隔离的缓存会串成 key A 的列表）", got)
+	}
+	// key B：拿到自己的列表，不得命中 A 的缓存
+	if got := fetch(t, "user_keyb"); got != "provider/model-b" {
+		t.Errorf("key B 拿到 %q，应为 provider/model-b（未隔离的缓存会串成 key A 的列表）", got)
+	}
+	// 同一 key 仍走 TTL 缓存（行为不变）
+	if got := fetch(t, "user_keya"); got != "provider/model-x" {
+		t.Errorf("key A 复取 = %q", got)
+	}
+	var modelsCalls int
+	f.mu.Lock()
+	modelsCalls = f.modelsHits
+	f.mu.Unlock()
+	if modelsCalls != 2 {
+		t.Errorf("upstream models calls = %d, want 2 (A/B 各一次；同 key 复取走缓存)", modelsCalls)
 	}
 }

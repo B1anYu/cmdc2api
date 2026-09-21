@@ -17,7 +17,7 @@ import (
 
 // ---------- 请求构造与上游 harness ----------
 
-// chatAuth 测试用客户端鉴权头（cmdc key 形状，getAPIKey 只认 user_ 前缀）。
+// chatAuth 测试用客户端鉴权头（cmdc key 形状；getAPIKey 只做提取，不限前缀）。
 var chatAuth = map[string]string{"x-api-key": "user_test123"}
 
 // chatRequestBody 组一个最小可用的 Chat 请求体。model 用回退列表里的名字，
@@ -913,7 +913,7 @@ func TestEndToEnd_ModelsOpenAICompatShape(t *testing.T) {
 		}
 	}
 
-	// 无 key：硬编码回退列表（用全新代理，避免命中上一个实例的 models 缓存）
+	// 无 key：硬编码回退列表（models 缓存按 key 隔离，无 key 恒走兜底，不会被别的 key 填充）
 	_, fallbackProxy := chatProxy(t, defaultScript())
 	resp, err := http.Get(fallbackProxy.URL + "/v1/models")
 	if err != nil {

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -60,22 +60,29 @@ func (s *Server) readBody(w http.ResponseWriter, r *http.Request, ew ErrorWriter
 
 // ---------- 鉴权 ----------
 
-var userKeyRe = regexp.MustCompile(`user_[a-zA-Z0-9_-]+`)
+// missingAPIKeyMessage 三端点共用的 401 文案。只有「确实没发 key」才会走到这里，
+// 因此文案点明期望的 cmdc key 形状（通常为 user_ 前缀）——按前缀过滤 key 会把
+// 「发了但格式不对」误报成「没发」，那种情况一律透传上游、由上游报错原路返回。
+const missingAPIKeyMessage = "Missing API key. Send a cmdc key (user_ prefix) in Authorization: Bearer <key> or x-api-key header"
 
-// getAPIKey 从 Authorization: Bearer 或 x-api-key 提取 user_ 前缀的 cmdc key，
-// 原样透传上游。
+// getAPIKey 从 Authorization: Bearer 或 x-api-key 提取客户端 key，原样透传上游。
+//
+// 不在代码里限制前缀：代理本身不校验 key 的合法性（见 AGENTS.md §三.1），
+// 上游未来也可能改用别的 key 形态（如 sk- 开头），此处按前缀过滤只会把
+// 「格式不对」误报成「没发 key」。
 func getAPIKey(h http.Header) string {
 	if auth := h.Get("Authorization"); len(auth) >= 7 && auth[:7] == "Bearer " {
-		if m := userKeyRe.FindString(auth[7:]); m != "" {
-			return m
+		if tok := strings.TrimSpace(auth[7:]); tok != "" {
+			return tok
 		}
 	}
-	if xk := h.Get("x-api-key"); xk != "" {
-		if m := userKeyRe.FindString(xk); m != "" {
-			return m
-		}
-	}
-	return ""
+	return strings.TrimSpace(h.Get("x-api-key"))
+}
+
+// writeMissingAPIKey 三端点共用的 401 出口：状态码、错误类型与文案只在上面一处定义，
+// 避免三份文案各自漂移（此前 messages/chat/responses 各抄了一份）。
+func writeMissingAPIKey(w http.ResponseWriter, ew ErrorWriter) {
+	ew.Write(w, http.StatusUnauthorized, "authentication_error", missingAPIKeyMessage, 0)
 }
 
 // ---------- 上游空闲超时 ----------
