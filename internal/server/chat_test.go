@@ -750,6 +750,100 @@ func TestChatCompletions_UpstreamHTTPErrors(t *testing.T) {
 	}
 }
 
+// ---------- 零输出（上游正常结束但零 token） ----------
+
+// chatZeroOutputScript 上游正常结束（发 finish）但 usage 报零输出；
+// prefix 为内容事件（留空即「零可见输出」的纯粹形态）。
+func chatZeroOutputScript(prefix ...string) []string {
+	lines := []string{`{"type":"start"}`}
+	lines = append(lines, prefix...)
+	return append(lines,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":50,"outputTokens":0}}`)
+}
+
+// TestChatCompletions_ZeroOutput 上游正常结束但零输出时必须转成 429，而不是把一次空响应
+// 当成功下发（下游会按成功计费）。Chat 侧此前对这条分支零覆盖：usage_missing 场景自带
+// text、估算 OutputTokens 为 1，不构成零输出（Anthropic 侧见
+// TestEndToEnd_ZeroOutputReturns429BeforeHeaders，Responses 侧此前只有编码器级覆盖）。
+//
+// 管线里零输出判定有两条出口，内容形态各测一次：
+//   - 零可见输出（流未开）→ 200 头都没发出去，回退 JSON 429；
+//   - 已有内容（流已开，状态码改不了）→ 只能以流内错误帧收场。
+//
+// 断言钉住 message 里的 "zero output tokens" 与 Retry-After: 10（空闲超时出口是 5），
+// 证明走的确实是零输出判定，而不是别的错误出口碰巧给了 429。
+func TestChatCompletions_ZeroOutput(t *testing.T) {
+	t.Run("no_content/stream", func(t *testing.T) {
+		_, proxy := chatProxy(t, chatZeroOutputScript())
+		resp := postChat(t, proxy, chatRequestBody(true), chatAuth)
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429（零输出不得当成功下发）\nbody:\n%s", resp.StatusCode, body)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Errorf("content-type = %q, want application/json（未开流时必须回退 JSON）", ct)
+		}
+		if strings.Contains(body, "data: ") {
+			t.Errorf("零输出不得发出任何 SSE 帧:\n%s", body)
+		}
+		if ra := resp.Header.Get("Retry-After"); ra != "10" {
+			t.Errorf("Retry-After = %q, want 10（零输出出口；空闲超时出口是 5）", ra)
+		}
+		assertOpenAIError(t, decodeJSON(t, body), "rate_limit_error", "rate_limit_exceeded", "zero output tokens")
+	})
+
+	t.Run("no_content/non_stream", func(t *testing.T) {
+		_, proxy := chatProxy(t, chatZeroOutputScript())
+		resp := postChat(t, proxy, chatRequestBody(false), chatAuth)
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429\nbody:\n%s", resp.StatusCode, body)
+		}
+		if strings.Contains(body, "data: ") {
+			t.Errorf("非流式不得是 SSE:\n%s", body)
+		}
+		if ra := resp.Header.Get("Retry-After"); ra != "10" {
+			t.Errorf("Retry-After = %q, want 10（零输出出口）", ra)
+		}
+		assertOpenAIError(t, decodeJSON(t, body), "rate_limit_error", "rate_limit_exceeded", "zero output tokens")
+	})
+
+	t.Run("content_then_zero_usage/stream", func(t *testing.T) {
+		_, proxy := chatProxy(t, chatZeroOutputScript(`{"type":"text-delta","text":"half"}`))
+		resp := postChat(t, proxy, chatRequestBody(true), chatAuth)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200（内容已开流，状态码改不了）\nbody:\n%s",
+				resp.StatusCode, readAll(t, resp))
+		}
+		sse := readAll(t, resp)
+		assertOrdered(t, "chat sse", sse, []string{
+			`"delta":{"content":"half"}`,
+			`"error":{"code":"rate_limit_exceeded"`,
+		})
+		// Chat 的契约：只有成功收尾才有 [DONE]，错误帧之后必须终止。
+		assertAbsent(t, "chat sse", sse, []string{"[DONE]", `"finish_reason":"stop"`})
+		// 末帧必须是那个错误帧本身，且成因是零输出（不是断流的 "Upstream error:"）
+		payloads := chatDataLines(t, sse)
+		errObj := mMap(t, decodeJSON(t, payloads[len(payloads)-1]), "error")
+		if got := mStr(t, errObj, "type"); got != "rate_limit_error" {
+			t.Errorf("error.type = %q, want rate_limit_error", got)
+		}
+		if msg := mStr(t, errObj, "message"); !strings.Contains(msg, "zero output tokens") {
+			t.Errorf("error.message = %q, want 命中零输出判定", msg)
+		}
+	})
+
+	t.Run("content_then_zero_usage/non_stream", func(t *testing.T) {
+		_, proxy := chatProxy(t, chatZeroOutputScript(`{"type":"text-delta","text":"half"}`))
+		resp := postChat(t, proxy, chatRequestBody(false), chatAuth)
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429（已有内容也照样是零输出）\nbody:\n%s", resp.StatusCode, body)
+		}
+		assertOpenAIError(t, decodeJSON(t, body), "rate_limit_error", "rate_limit_exceeded", "zero output tokens")
+	})
+}
+
 // ---------- 归一化落到上游信封 ----------
 
 // TestChatCompletions_UpstreamEnvelope 断言 Chat 请求经归一化后在上游信封里的形状：

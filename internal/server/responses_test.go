@@ -1120,6 +1120,108 @@ func TestResponses_UpstreamHTTPErrors(t *testing.T) {
 	}
 }
 
+// ---------- 零输出（上游正常结束但零 token） ----------
+
+// responsesZeroOutputScript 上游正常结束（发 finish）但 usage 报零输出；
+// prefix 为内容事件（留空即「零可见输出」的纯粹形态）。
+func responsesZeroOutputScript(prefix ...string) []string {
+	lines := []string{`{"type":"start"}`}
+	lines = append(lines, prefix...)
+	return append(lines,
+		`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":50,"outputTokens":0}}`)
+}
+
+// TestResponses_ZeroOutput 上游正常结束但零输出时必须转成 429 / response.failed，
+// 而不是把一次空响应当成功下发（下游会按成功计费）。Responses 侧此前只有编码器级
+// 覆盖（translate/respout_test.go 手工喂事件），整条管线从未执行过：
+// usage_missing 场景自带 text、估算 OutputTokens 为 1，不构成零输出。
+//
+// 零输出判定在管线里有两条出口，内容形态各测一次：
+//   - 零可见输出（流未开）→ 200 头都没发出去，回退 JSON 429；
+//   - 已有内容（流已开，状态码改不了）→ 以 response.failed 收场并保留已产出的内容。
+//
+// 断言钉住错误消息里的 "zero output tokens" 与 Retry-After: 10（空闲超时出口是 5，
+// 断流出口是 502 + "Upstream error:"），证明走的确实是零输出判定。
+func TestResponses_ZeroOutput(t *testing.T) {
+	t.Run("no_content/stream", func(t *testing.T) {
+		_, proxy := responsesProxy(t, responsesZeroOutputScript(), nil)
+		resp := postResponses(t, proxy, responsesBody(true, ""), responsesAuth)
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429（零输出不得当成功下发）\nbody:\n%s", resp.StatusCode, body)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Errorf("content-type = %q, want application/json（未开流时必须回退 JSON）", ct)
+		}
+		if strings.Contains(body, "event: ") {
+			t.Errorf("零输出不得发出任何 SSE 帧:\n%s", body)
+		}
+		if ra := resp.Header.Get("Retry-After"); ra != "10" {
+			t.Errorf("Retry-After = %q, want 10（零输出出口；空闲超时出口是 5）", ra)
+		}
+		assertOpenAIError(t, decodeJSON(t, body), "rate_limit_error", "rate_limit_exceeded", "zero output tokens")
+	})
+
+	t.Run("no_content/non_stream", func(t *testing.T) {
+		_, proxy := responsesProxy(t, responsesZeroOutputScript(), nil)
+		resp := postResponses(t, proxy, responsesBody(false, ""), responsesAuth)
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429\nbody:\n%s", resp.StatusCode, body)
+		}
+		if strings.Contains(body, "event: ") {
+			t.Errorf("非流式不得是 SSE:\n%s", body)
+		}
+		if ra := resp.Header.Get("Retry-After"); ra != "10" {
+			t.Errorf("Retry-After = %q, want 10（零输出出口）", ra)
+		}
+		assertOpenAIError(t, decodeJSON(t, body), "rate_limit_error", "rate_limit_exceeded", "zero output tokens")
+	})
+
+	t.Run("content_then_zero_usage/stream", func(t *testing.T) {
+		_, proxy := responsesProxy(t, responsesZeroOutputScript(`{"type":"text-delta","text":"half"}`), nil)
+		resp := postResponses(t, proxy, responsesBody(true, ""), responsesAuth)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200（内容已开流，状态码改不了）\nbody:\n%s",
+				resp.StatusCode, readAll(t, resp))
+		}
+		sse := readAll(t, resp)
+		frames := respFrames(t, sse)
+		last := frames[len(frames)-1]
+		if last.name != types.ResponsesEventFailed {
+			t.Fatalf("零输出流必须以 response.failed 收场，得到 %v", respEvents(frames))
+		}
+		assertAbsent(t, "responses sse", sse, []string{"[DONE]", "response.completed"})
+		assertResponsesStreamInvariants(t, frames)
+
+		respObj := mMap(t, last.data, "response")
+		if got := mStr(t, respObj, "status"); got != types.ResponsesStatusFailed {
+			t.Errorf("status = %q, want failed", got)
+		}
+		errObj := mMap(t, respObj, "error")
+		if got := mStr(t, errObj, "code"); got != "rate_limit_error" {
+			t.Errorf("error.code = %q, want rate_limit_error（不是断流的 api_error）", got)
+		}
+		if msg := mStr(t, errObj, "message"); !strings.Contains(msg, "zero output tokens") {
+			t.Errorf("error.message = %q, want 命中零输出判定", msg)
+		}
+		// 终态仍要带完整 output：零输出判定发生在收尾，已产出的内容不得丢
+		if got := respContentText(t, respOutputItems(t, respObj, 1)[0]); got != "half" {
+			t.Errorf("零输出前的部分产出丢了: %q", got)
+		}
+	})
+
+	t.Run("content_then_zero_usage/non_stream", func(t *testing.T) {
+		_, proxy := responsesProxy(t, responsesZeroOutputScript(`{"type":"text-delta","text":"half"}`), nil)
+		resp := postResponses(t, proxy, responsesBody(false, ""), responsesAuth)
+		body := readAll(t, resp)
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("status = %d, want 429（已有内容也照样是零输出）\nbody:\n%s", resp.StatusCode, body)
+		}
+		assertOpenAIError(t, decodeJSON(t, body), "rate_limit_error", "rate_limit_exceeded", "zero output tokens")
+	})
+}
+
 // ---------- 归一化落到上游信封 ----------
 
 // TestResponses_UpstreamEnvelope 断言 Responses 请求经归一化后在上游信封里的形状，

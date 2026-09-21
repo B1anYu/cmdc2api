@@ -3,7 +3,7 @@
 ## 一、 项目定位与参照
 
 - **项目目标**：多协议入站反向代理——Anthropic Messages（一等公民）、OpenAI Responses（面向 Codex CLI）与 OpenAI Chat Completions 三端点 → cmdc 单跳直转（Go 编写，零第三方依赖，静态二进制部署）。
-- **当前版本**：`v0.1.4`（2026-09-17）。
+- **当前版本**：`v0.2.0`（2026-09-17，tag 指向 `8d05b3e` 的多协议入站实现）。分支 `fix/verified-findings-2026-09` 上的缺陷修正在此之后，尚未发版。
 - **权威参照**：
   - 协议事实与伪装标准：`reference/commandcode-proxy/proxy.mjs`（MIT，基于 commit `fcdb56a`）。
   - 协议转换技法参考：`reference/sub2api/backend/internal/pkg/apicompat`（LGPL-3.0，仅借鉴架构手法，未复制代码）。
@@ -44,24 +44,35 @@
    - 工具调用全量参数按 ~10 rune 分片模拟增量（上游一次性给全 input）。
    - Codex 工具族（custom/grammar、tool_search、namespace、additional_tools）入站降级为普通 function 工具，`ResponsesToolMapping` 由 respin 产出、respout 按其回程还原 item 形态（`fc_/ctc_/tsc_` id 前缀）；`previous_response_id` 一律 400 拒绝（Codex `store:false` 全量回放，不依赖服务端状态）。
    - tool_use/tool_result 配对修复（`translate/pairing.go` 的 merge→pair→merge）是双入站共享的正确性核心，三条不变式：结果紧邻前条调用、调用被下条结果应答、角色严格交替。
-4. **会话亲和优先级**：
+4. **会话亲和优先级**（`masq/session.go` 的 `ResolveSession` + `translate.PrefixCacheKey`）：
    - 优先级 1：显式 Session Header（`x-session-id` / `x-claude-code-session-id` / `session_id` ≥ 8 字符）；
-   - 优先级 2：前缀哈希派生（`CC_SESSION_STRATEGY=prefix`，默认）：`sha256(system + tools + 首条用户消息)`，同对话跨轮稳定；
-   - 优先级 3：Per-Key 轮换（`CC_SESSION_STRATEGY=key`，原版 12h + 1h 抖动轮换）。
+   - 优先级 2：客户端显式声明的 `prompt_cache_key`（OpenAI Chat/Responses 字段，长度 ≥ 8 才采用）——它是客户端对「这条对话属于哪个缓存前缀」的显式声明，比我们派生的哈希更权威；依据 A 级参照 `proxy.mjs:204-210`（把该字段作为 x-session-id 候选之一）；
+   - 优先级 3：前缀哈希派生（`CC_SESSION_STRATEGY=prefix`，默认）：`sha256(system + tools + 首条用户消息)`，同对话跨轮稳定；
+   - 优先级 4：Per-Key 轮换（`CC_SESSION_STRATEGY=key`，原版 12h + 1h 抖动轮换）。
+   - **无论来源，输出都会再哈希一次并格式化为 UUID 形状**：该会话键还会进入 `WorkingDirForSession` 与上游请求头，不能让客户端可控字符串直接外泄到那些位置。
 5. **Thinking 思考回传与签名**：
    - 上游 CC 在思考模式下强制校验历史中的思考过程，缺失会导致 `502 (The reasoning_content in the thinking mode must be passed back to the API)`；
    - 历史 assistant 思考块默认以 `{type: "reasoning", text: ...}` 格式回传上游（可通过 `CC_ASSISTANT_REASONING=0` 显式禁用），且严格遵循 CC CLI 抓包顺序 `[reasoning, text, tool-call]`；
    - Thinking 思考签名采用确定性伪造（`0x12` + sha256 前缀）满足下游客户端浅校验；上游不接受也不回传签名，历史记录中的签名发往上游时需过滤。
+   - **思考档位值域**：`low`/`medium`/`high`/`max`/`xhigh` **原样透传**（依据：A 级 `README.md:100` 值域为 `low/medium/high/max`、`:365` 明写 pass-through、`proxy.mjs:512-513` 直接透传；`xhigh` 的依据是**用户对上游的实测认知**，A 级文档未列该档）；仅 `minimal → low`（**未验证的下映射**，`minimal` 不在 A 级值域内）。Anthropic 的 `thinking.budget_tokens` 仍按既有阈值折算（`≥10000→high`、`≥5000→medium`、`>0→low`，借自 **C 级** litellm，未经 A 级验证），`adaptive` 形态缺省 `medium`。⚠️ **原「上游只认 low/medium/high」与 `xhigh/max→high` 收窄的口径已被 A 级证伪，勿回退。**
 6. **安全丢弃字段**（上游无对应能力，对齐原版行为）：
    - Anthropic 入站：`stop_sequences`、`top_k`、`metadata.user_id`、`tool_result.is_error`。
-   - Responses/Chat 入站追加：`truncation`、`include`、`background`、`service_tier`、`prompt_cache_key`、`safety_identifier`、`user`、`metadata`、`text`（format/verbosity）、`top_logprobs`、`stream_options`、`logprobs`、`response_format`/`text.format`（结构化输出，安全丢弃不转换）；Chat 追加 `stop`（不映射、不落 `out.StopSequences`）、`frequency_penalty`、`presence_penalty`、`logit_bias`、`store`、`prediction`、`extra_body`（无类型字段由 `types.ChatIgnoredFields(raw)` 探测存在性后留痕）；Chat 的 `n>1` 直接 400。
+   - Responses/Chat 入站追加：`truncation`、`include`、`background`、`service_tier`、`safety_identifier`、`user`、`metadata`、`text`（format/verbosity）、`top_logprobs`、`stream_options`、`logprobs`、`response_format`/`text.format`（结构化输出，安全丢弃不转换）；Chat 追加 `stop`（不映射、不落 `out.StopSequences`）、`frequency_penalty`、`presence_penalty`、`logit_bias`、`store`、`prediction`、`extra_body`（无类型字段由 `types.ChatIgnoredFields(raw)` 探测存在性后留痕）；Chat 的 `n>1` 直接 400。
+   - **`prompt_cache_key` 不在本清单内**：它被**消费**为会话亲和候选（见 §三.4 优先级 2），既不是丢弃项、也无信息损失，故**不报 ignored、不留痕**。它由 `types.ChatRequest`/`ResponsesRequest` 的类型化字段读入并搬运到 `types.Request.PromptCacheKey`。
+   - `top_p`：**有意静默丢弃——不转发上游、不回显、不留痕**。`BuildCcRequest` 三条入站共用且只转发 `temperature`，该参数从未到达上游；而它此前被回显在 Responses 响应对象（含流式终态事件）里，等于向客户端谎报「参数已生效」——**谎报才是真缺陷**。本项是「所有丢弃必须留痕」规约的**唯一显式例外**（2026-09-21 用户拍板：该参数几乎无人使用，不值得为它引入 warn）。修正经共用的 `BuildCcRequest` 对 **Anthropic 一等公民路径同样生效**。
    - `reasoning.encrypted_content` 丢弃**不留痕**（Codex 每轮必发，留痕会淹没日志）。
    - Anthropic 原生入站的**降级 / 钳制**（文案自带「哪个工具·哪个字段 + 我们做了什么 + 后果」，且**同一请求内聚合为一条**，避免长对话刷屏）：
      - 工具 `input_schema` 非 object（顶层 `anyOf`/`oneOf`、`type` 缺失或非 `"object"`、非法 JSON）→ 整体替换为 `{"type":"object","properties":{}}`（保守行为，**不改为透传**：透传 `anyOf` 无任何一级证据，而 MCP 工具联合 schema 被拒会使整轮 400）；
      - `tool_choice` 未知 `type` → 降级为 `auto`；`{type:"tool"}` 缺 `name` → 原样发出无名 `{"type":"tool"}`（这两个静默分支**仅 Anthropic 原生入站可达**：Chat/Responses 在各自预归一层已留痕）；
      - `max_tokens > 200000` → 钳制到 200000（**上限保留**，不提高、不改为纯透传）。
+   - Responses 与 Chat 入站的**降级 / 换算**（口径与 Anthropic 侧一致，同请求内聚合）：
+     - 工具 `parameters` 非 object（无参数、顶层 `anyOf`/`oneOf`、`type` 缺失或非 object、非法 JSON）→ 同样整体替换为 `{"type":"object","properties":{}}` 并聚合留痕；
+     - 工具参数 `arguments` 非法 JSON → 兜底 `{}` 并留痕（原始文本就此丢失）；合法 JSON 但非 object → **原样透传**并留痕（**不擅自包一层**）——**两条入站路径共用同一实现**（`chatToolArgsReport`）；
+     - **未知 `role` 的 message / input item → 降级为一条 user 消息（内容保留）**，留痕记「downgraded to a user message」。依据 A 级参照 `proxy.mjs:467-468`（其注释理由是「避免 CC 校验拒绝」）。**取代此前的「整条丢弃」**；
+     - Responses 的 `tool_search_output` **仅在 `status == "completed"` 时才提升**为正式工具声明（缺 `status` 不再被当作完成态）。
    - **绝不覆写**（非丢弃项，登记于此以防文档与代码互相矛盾）：客户端 part 级 `cache_control`（含 `ttl`）**原样透传**，仅当 `type` 缺失时补 `"ephemeral"`，**无 ttl 时不合成 ttl**——cmdc 之下还有它自己的上游（deepseek 等默认 24h 缓存），覆写 ttl 会真的拉低其默认缓存时长（见 `types.CacheControl` 注释）。
-   - 所有丢弃必须留痕（`info:` 前缀为良性观测，其余 warn），两条入站路径口径一致（空 tool_result 归一化为 `""`、effort 档位收窄 `minimal→low`、`xhigh/max→high`）。
+   - **出站 item 生命周期不变式**：任何 item 在**每条终结路径**（正常收尾、流内 error 事件、上游半截断开）上都必须**先 part done、再 item done**；`reasoning` 块同样如此（此前只有 message 文本块那半做了收尾，思考块漏了，严格客户端会看到 part 永久悬空）。`tool_search_call.arguments` 线上**恒为对象**（解析结果为 `null`/空/非预期类型时归一为 `{}`）。
+   - 所有丢弃必须留痕（`info:` 前缀为良性观测，其余 warn），两条入站路径口径一致（空 tool_result 归一化为 `""`）。思考档位值域见 §三.5。
 7. **客户端伪装自洽性**：
    - 指纹/Lifecycle/信封 Environment/WorkingDir 全套对齐 Windows x64。
    - 出站 Transport 强制 `HTTP/1.1` 且置空 `User-Agent`（Go 中 `h.Set("User-Agent", "")` 可抑制默认 UA）。
@@ -102,18 +113,56 @@ total_tokens = input_tokens + output_tokens
 
 ## 五、 Prompt Cache 缓存断点机制
 
-1. **缓存正常表现**：$C \approx P$（50% 比例）正是第二步全量命中缓存的正常表现，非缺陷。
+1. **缓存正常表现**：$C \approx P$（50% 比例）正是第二步全量命中缓存的正常表现，非缺陷。⚠️ **早期曾据此误判「命中率异常」**——真实原因是统计口径把 token 算了两遍、使命中率永远 ≤50%；该误判当初催生了「断点放信封末尾」的设计。**测量命中率前必须先确认不受统计口径干扰**，否则会再次被假象带偏。
 2. **断点合成位置**：从**信封整体末尾**向前回扫最后一个 `text` part（勿改回只扫 `user` 消息 —— Agent 交互链尾部常为 `role: "tool"`，只扫 user 会停滞在首条人类消息）。
 3. **客户端标记优先**：
    - `CC_CACHE_MARKERS=respect`（默认）：优先透传客户端 part 级标记，仅在缺失时进行末尾合成。
    - `CC_CACHE_MARKERS=replace`：剥离客户端标记并强制末尾合成（仅用于 A/B 诊断）。
-4. **断点可观测性**：
+4. **两条新端点如何拿到断点**：OpenAI Chat 与 Responses 协议**没有 `cache_control` 字段**，因此入站归一化层在 `types.Request` 上置 `SynthesizeTailCacheMarker`，信封构造据此在末尾合成断点——否则这两个端点永远没有 part 级断点，只剩会话亲和一条缓存路径。**Anthropic 一等公民路径不置该标志**（它本就能表达 part 级标记），故其现有行为不变。
+5. **断点可观测性**：
    - 透传日志：`info: ... marker(s) present in envelope`
-   - 合成日志：`WARN: no part-level cache_control found`
+   - 合成日志：`WARN: no part-level cache_control present in the envelope; synthesized ...`（文案成因中立，覆盖「system/tools 标记折算」与「协议本无该字段」两种情形）
+6. **⚠️ 未决的设计问题（勿当既定结论用）**：
+   - 断点**位置**的正当性存疑（本项目用「信封末尾」；A 级参照 `proxy.mjs:472-476` 用「首条 user 消息的最后一个 text part」），且第 1 条所述的驱动理由已被证伪。留待**缓存专项轮次**研究。
+   - 按本节的字面口径，`respect` 模式下「无任何标记时也应合成」——但 Anthropic 入站目前只在 `sysCC||toolsCC` 时合成。该口径差**尚未裁决**，勿擅自改动 Anthropic 路径行为。
+   - 多断点（上限 4 的钳制，仅 C 级旁证）在新增多断点前必须补钳制。
+   - **工具级 `cache_control` 不进入信封**，其 `ttl` 因此不生效（见 §三.6）。
 
 ---
 
 ## 六、 环境与发版流水线
+
+### 环境变量全量清单（以 `internal/config/config.go` 为准）
+
+| 变量 | 默认值 | 作用 |
+|---|---|---|
+| `PORT` | `8050` | 监听端口 |
+| `HOST` | `127.0.0.1` | 监听地址（容器内需 `0.0.0.0`） |
+| `CC_API_BASE` | `https://api.commandcode.ai` | 上游基址 |
+| `CC_STATE_FILE` | `data/state.json` | 设备指纹与 lifecycle 节流状态 |
+| `CC_MAX_BODY_MB` | `100` | 请求体上限 |
+| `CC_MODEL_REFRESH` | `5m` | `/v1/models` 缓存 TTL（**按 apiKey 分别缓存**） |
+| `CC_SESSION_STRATEGY` | `prefix` | 会话亲和策略：`prefix` / `key` |
+| `CC_CACHE_MARKERS` | `respect` | 断点策略：`respect` / `replace` |
+| `CC_ASSISTANT_REASONING` | `1` | 是否回传历史思考块（`0` 禁用） |
+| `CC_FAKE_NODE_VERSION` | `v22.21.0` | 信封 `environment` 里上报的 Node 版本 |
+| `CMD_ZDR` | `false` | 置 1 时全局附加 `x-cmd-zdr: 1` 头（可被单请求覆盖） |
+
+（既有说明：`CC_SESSION_STRATEGY` 见 §三.4；`CC_CACHE_MARKERS` 见 §五.3；`CC_ASSISTANT_REASONING` 见 §三.5。）
+
+### 本地构建与测试
+
+```bash
+go vet ./... && go test -race -count=1 ./...     # 提交前必跑；-race 是硬要求
+go test -race -count=3 ./...                     # 收工时确认无抖动（超时类测试最易抖）
+go build -o cmdc2api . && ./cmdc2api             # 本地起服务，默认 127.0.0.1:8050
+docker compose up -d                             # 容器方式（挂 ./data:/data，容器内须 HOST=0.0.0.0）
+```
+
+- 单条提交的隔离验证：`git worktree add --detach /tmp/v <sha> && (cd /tmp/v && go test ./...)`，用完 `git worktree remove`。
+  （只跑工作树的测试无法验证「单个提交是否自洽」，这个做法可以。）
+
+### 开发与部署
 
 - **开发与部署环境**：开发与部署均在 VPS。
 - **构建流**：`git push origin main` $\rightarrow$ GitHub Actions CI（vet / test -race / lint）+ GHCR `:dev` 双架构镜像。
@@ -147,7 +196,38 @@ total_tokens = input_tokens + output_tokens
 
 ---
 
-## 八、 智能体协作指引
+## 八、 假设台账与交付前对账（防「四重闭环」复发）
+
+**背景**：本项目发生过一次事故——`reasoning_effort` 的 `{minimal→low, xhigh→high, max→high}` 收窄**无任何出处**（真实来源是 litellm 的 `together_ai` provider 专用适配器，属 C 级），却经「规格无出处断言 → 实现忠实执行 → 测试锁定假设 → 本文件固化」四重闭环一路合入，直到以 A 级参照逐字段对账才发现。同类事故还在缓存断点处重演过一次（评估阶段想当然「新端点会自动继承断点合成」）。
+
+### 参考源效力分级（写作与审查都按此执行）
+
+| 级别 | 内容 | 可用性 |
+|---|---|---|
+| **A 级** | 抓包、`reference/commandcode-proxy/`（自述基于真实 CLI 抓包）、上游报错回执 | **可作值域与字段行为依据** |
+| **B 级** | 针对同一上游的实现建模（如 axonhub 的 `PlatformCommandCode` 能力矩阵） | 强旁证 |
+| **C 级** | 多上游网关的内部启发式（litellm / CLIProxyAPI / sub2api 的映射表、默认值、阈值） | **只能证明「有这种做法」，不得作为值域依据** |
+
+### 硬性要求
+
+1. **每条上游能力断言必须标注出处**；无出处就写 `未验证`，且**不得作为约束依据**。
+2. **禁止用 C 级来源作值域依据**。
+3. 审查基准是「**实现 vs 权威参照逐字段对账**」，不是「实现 vs 需求」——只有前者能发现「本地收窄 vs 参照透传」这类偏差。
+4. 「阶段自报」≠「当前事实」：子代理在某一阶段报告「未修/待后续」的项，可能已被后续阶段修掉；**入清单前必须对 HEAD 复核**（`git show HEAD:<file>`）。本项目已出现 3 例此类伪发现（`readBody`、非流式 `incomplete_details`、reasoning 往返不变式）。
+5. **A 级沉默 ≠ 实现有错**：若 A 级对该能力无覆盖，保守实现可以保留，但**必须补留痕**并把注释里「已验证」之类的失实表述改掉；只有在 A 级**明确反对**时才改行为。
+
+### 交付前对账清单（改动涉及入站字段时逐条走）
+
+- [ ] 本次新增/修改的每个字段，其行为是否有 A 级（或用户实测）出处？写进注释了吗？
+- [ ] 三条入站路径对同一语义的处理是否**口径一致**？有跨路径一致性测试吗？
+- [ ] 每个丢弃 / 降级 / 钳制 / 覆写都留痕了吗？文案是否自带「哪个字段 + 做了什么 + 后果」？同请求内是否聚合？
+- [ ] 涉及的出站 item 生命周期，在**每条终结路径**上都闭合吗（不只是正常收尾）？
+- [ ] 本文件与代码是否一致？（`stop` 死映射、`prompt_cache_key` 曾被列为「已丢弃」、失效的版本号，都是文档/代码互相矛盾的实例。）
+- [ ] 新增测试是否**真的会失败**？（临时破坏被测行为确认变红，再还原。）
+
+---
+
+## 九、 智能体协作指引
 
 - **主动发版 Tag 提醒规范**：
   - **触发时机**：当协助完成功能新增、Bug 修复或准备交付部署时。

@@ -78,6 +78,7 @@ func respAssertGolden(t *testing.T, names []string, payloads []map[string]any, w
 	respAssertSequence(t, payloads)
 	respAssertItemLifecycle(t, payloads, wantItems)
 	respAssertPartOrdering(t, payloads)
+	respAssertPartsClosedBeforeItemDone(t, payloads)
 }
 
 // respAssertSequence sequence_number 必须从 0 起、每个已发事件（含终态）递增 1。
@@ -184,6 +185,33 @@ func respAssertPartOrdering(t *testing.T, payloads []map[string]any) {
 	for key := range summaries {
 		if !summariesDone[key] {
 			t.Fatalf("reasoning_summary_part %s 只 added 未 done", key)
+		}
+	}
+}
+
+// respAssertPartsClosedBeforeItemDone 「先 part done、再 item done」的顺序不变式。
+// 只断言 part 成对（respAssertPartOrdering）不够：顺序反过来时 part 确实成对，
+// 但严格客户端（Codex）会在 item 已经结束之后才收到 part 收尾——#3 的另一半就藏在这里。
+func respAssertPartsClosedBeforeItemDone(t *testing.T, payloads []map[string]any) {
+	t.Helper()
+	itemDoneAt := map[string]int{}
+	for i, p := range payloads {
+		if p["type"] == types.ResponsesEventOutputItemDone {
+			itemDoneAt[strconv.Itoa(int(respNum(t, p, "output_index")))] = i
+		}
+	}
+	for i, p := range payloads {
+		switch p["type"] {
+		case types.ResponsesEventContentPartDone, types.ResponsesEventReasoningSummaryPartDone:
+			idx := strconv.Itoa(int(respNum(t, p, "output_index")))
+			at, ok := itemDoneAt[idx]
+			if !ok {
+				t.Fatalf("output_index %s 的 %v 没有可配对的 output_item.done: %v", idx, p["type"], p)
+			}
+			if i >= at {
+				t.Fatalf("output_index %s: %v（第 %d 个事件）不早于 output_item.done（第 %d 个）——part 必须先 done",
+					idx, p["type"], i, at)
+			}
 		}
 	}
 }
@@ -946,127 +974,265 @@ func TestResponsesOut_ZeroOutputErrorPath(t *testing.T) {
 	}
 }
 
-// TestResponsesOut_ItemPartsClosedOnEveryTerminationPath 「块类型 × 终结路径」矩阵：
-// item 被强制收尾时（流内报错、上游半截断开），已宣告的 part 必须先 done 再关 item。
-//
-// 严格客户端（Codex）收到 reasoning_summary_part.added 后会一直等 part.done / summary_text.done，
-// 只发 output_item.done 会让该 part 永久悬空（#3）。正常 content_block_stop 路径由既有 golden 覆盖，
-// 这里补两条「不经 content_block_stop 的强制收尾」路径——单场景 golden 挡不住这类缺口（D9 教训）。
-//
-// 可达性：流内报错路径真实可达（idle 超时/断流由管线合成 error 事件喂给编码器，
-// 而 StreamTranslator 在 hasError 时不再关块）；半截流路径钉的是编码器自身的 Finish 契约
-// （管线无条件调用 enc.Finish()，不允许残留悬空 part）。
-func TestResponsesOut_ItemPartsClosedOnEveryTerminationPath(t *testing.T) {
-	cases := []struct {
-		name       string
-		lines      []string
-		truncated  bool // true：不喂 StreamTranslator.Finish 的事件，模拟上游半截断开
-		want       []string
-		wantStatus string
-		wantType   string
-		wantText   string
-	}{
-		{
-			name: "思考块 × 流内报错",
-			lines: []string{
-				`{"type":"reasoning-start"}`,
-				`{"type":"reasoning-delta","text":"thinking hard"}`,
-				`{"type":"error","error":{"message":"<429> slow down"}}`,
-			},
-			want: []string{
-				"response.created",
-				"response.in_progress",
-				"response.output_item.added",
-				"response.reasoning_summary_part.added",
-				"response.reasoning_summary_text.delta",
-				// 报错时思考块还开着：摘要 part 必须先收尾，item 才能关
-				"response.reasoning_summary_text.done",
-				"response.reasoning_summary_part.done",
-				"response.output_item.done",
-				"response.failed",
-			},
-			wantStatus: types.ResponsesStatusFailed,
-			wantType:   types.ResponsesItemReasoning,
-			wantText:   "thinking hard",
-		},
-		{
-			name: "思考块 × 上游半截断开",
-			lines: []string{
-				`{"type":"reasoning-start"}`,
-				`{"type":"reasoning-delta","text":"cut off"}`,
-			},
-			truncated: true,
-			want: []string{
-				"response.created",
-				"response.in_progress",
-				"response.output_item.added",
-				"response.reasoning_summary_part.added",
-				"response.reasoning_summary_text.delta",
-				"response.reasoning_summary_text.done",
-				"response.reasoning_summary_part.done",
-				"response.output_item.done",
-				"response.completed",
-			},
-			wantStatus: types.ResponsesStatusCompleted,
-			wantType:   types.ResponsesItemReasoning,
-			wantText:   "cut off",
-		},
-		{
-			name:      "文本块 × 上游半截断开",
-			lines:     []string{`{"type":"text-delta","text":"half a sentence"}`},
-			truncated: true,
-			want: []string{
-				"response.created",
-				"response.in_progress",
-				"response.output_item.added",
-				"response.content_part.added",
-				"response.output_text.delta",
-				"response.output_text.done",
-				"response.content_part.done",
-				"response.output_item.done",
-				"response.completed",
-			},
-			wantStatus: types.ResponsesStatusCompleted,
-			wantType:   types.ResponsesItemMessage,
-			wantText:   "half a sentence",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			evs := respStreamEvents(t, tc.lines...)
-			if tc.truncated {
-				evs = respTruncatedStreamEvents(t, tc.lines...)
-			}
-			enc := NewResponsesEncoder("test-model", "resp_x", nil)
-			names, payloads := respRun(t, enc, evs)
-			// respAssertGolden 连带跑 item 配对与 part 成对不变式：
-			// 悬空的 reasoning_summary_part 会被 respAssertPartOrdering 直接抓住。
-			respAssertGolden(t, names, payloads, tc.want, 1)
+// ---------- 块类型 × 终结路径矩阵 ----------
 
-			resp := respTerminal(t, payloads)
-			if got := resp["status"]; got != tc.wantStatus {
-				t.Errorf("status = %v, want %s", got, tc.wantStatus)
-			}
-			// 失败/断流前已聚合的产出必须留在 output 里，客户端才能还原
-			items := respList(t, resp, "output")
-			if len(items) != 1 {
-				t.Fatalf("output = %d 项, want 1", len(items))
-			}
-			item := items[0].(map[string]any)
-			if item["type"] != tc.wantType {
-				t.Fatalf("output[0].type = %v, want %s", item["type"], tc.wantType)
-			}
-			var text string
-			if tc.wantType == types.ResponsesItemReasoning {
-				text = respStr(t, respList(t, item, "summary")[0].(map[string]any), "text")
-			} else {
-				text = respStr(t, respList(t, item, "content")[0].(map[string]any), "text")
-			}
-			if text != tc.wantText {
-				t.Errorf("output 文本 = %q, want %q", text, tc.wantText)
-			}
-		})
+// responsesBlockCase 矩阵的「块类型」一格：开启该块并把内容喂进去的上游行。
+type responsesBlockCase struct {
+	name string
+	// lines 喂完后块仍处于打开状态（tool-call 除外，见测试注释中的可达性说明）。
+	lines    []string
+	itemType string
+	// lifecycle 是除 created / in_progress / 终态之外的事件名序列（相邻重复的增量折叠为一条：
+	// 分片条数取决于分片粒度，与块的生命周期形状无关）。
+	lifecycle []string
+	// wantDone 是该块必须发出的「收尾事件」：缺任何一条，严格客户端都会永久等待该 part/参数。
+	wantDone []string
+	// deltaEvent 参数类块的增量事件名；"" 表示该块不发增量。
+	deltaEvent string
+	// text 从终态 output[0] 取出已聚合的产出。
+	text func(t *testing.T, item map[string]any) string
+	// wantText 是 text 的期望值；参数类块同时用它与增量拼接结果比对。
+	wantText string
+}
+
+// responsesTerminationCase 矩阵的「终结路径」一格：上游如何结束这条流。
+type responsesTerminationCase struct {
+	name       string
+	extraLines []string // 追加在块行之后的上游行
+	truncated  bool     // true：不调 StreamTranslator.Finish，模拟上游没给终止事件就断开
+	wantName   string   // 终态事件名
+	wantStatus string
+}
+
+// TestResponsesOut_BlockKindByTerminationMatrix 「块类型 × 终结路径」矩阵。
+//
+// 每个交叉格都必须满足：
+//   - 该关的 part 都关了，且**先 part done、再 item done**（respAssertPartsClosedBeforeItemDone）；
+//   - output_item.added/done 严格配对、output_index 连续（respAssertItemLifecycle）；
+//   - 无悬空 part（respAssertPartOrdering）；
+//   - 块的收尾事件序列**不随终结路径改变**，终结路径只决定终态事件与 response.status；
+//   - 终结前已聚合的产出留在终态 output 里，客户端才能还原。
+//
+// 为什么是矩阵而不是单场景 golden：本项目的既有教训是「不变式检查器只做单场景 golden，
+// 漏了 thinking 那半」——#3（reasoning part 不闭合）与 #18 都是矩阵缺口，不是某个场景写错了。
+// 按「块 × 路径」全交叉展开后，新增一种块或一条终结路径都会自动落进覆盖里。
+//
+// 每条终结路径都对应生产代码里真实存在的分支（pipeline.go serveStream）：
+//   - 正常收尾：上游给 finish → StreamTranslator.Finish 关块 → message_stop → message_delta；
+//   - 流内报错：idle 超时/断流由管线合成 error 事件喂给编码器，而 StreamTranslator 在 hasError
+//     时不再关块（stream.go Finish），因此报错时块仍开着——这条路径就是 #3 的现场；
+//   - 上游半截断开：管线读到 sc.Err() 后直接 return，**不调** tr.Finish，只由管线无条件调用的
+//     enc.Finish() 兜底（「管线无条件调用 Finish」是编码器的契约，幂等由状态机自己保证）。
+//
+// 一个**不成立**的组合（不写 t.Skip，说明理由）：工具类块（function_call / custom_tool_call /
+// tool_search_call）×「块仍开着就被强制收尾」。StreamTranslator 把 tool-call 行当作原子单位
+// （stream.go：一次 Feed 内同时产出 ContentBlockStart + InputJSONDelta + ContentBlockStop），
+// 因此工具块在回到事件循环之前就已由 content_block_stop 关闭，任何终结路径都碰不到「打开的工具块」。
+// 该缺口只在「上游改为分片发参数」（chatout.go 的 Builder 定时炸弹 F20 同类风险）后才可达；
+// 届时本矩阵需要补一条手工构造事件的行，并同步检查 closeOpen 是否为工具块补发
+// function_call_arguments.done / custom_tool_call_input.done（closeOpen 目前只补 message 与 reasoning 的 part）。
+func TestResponsesOut_BlockKindByTerminationMatrix(t *testing.T) {
+	blocks := []responsesBlockCase{
+		{
+			name:     "message 文本块",
+			lines:    []string{`{"type":"text-delta","text":"half a sentence"}`},
+			itemType: types.ResponsesItemMessage,
+			lifecycle: []string{
+				types.ResponsesEventOutputItemAdded,
+				types.ResponsesEventContentPartAdded,
+				types.ResponsesEventOutputTextDelta,
+				types.ResponsesEventOutputTextDone,
+				types.ResponsesEventContentPartDone,
+				types.ResponsesEventOutputItemDone,
+			},
+			wantDone: []string{types.ResponsesEventOutputTextDone, types.ResponsesEventContentPartDone},
+			text: func(t *testing.T, item map[string]any) string {
+				return respStr(t, respList(t, item, "content")[0].(map[string]any), "text")
+			},
+			wantText: "half a sentence",
+		},
+		{
+			name:     "reasoning 思考块",
+			lines:    []string{`{"type":"reasoning-delta","text":"thinking hard"}`},
+			itemType: types.ResponsesItemReasoning,
+			lifecycle: []string{
+				types.ResponsesEventOutputItemAdded,
+				types.ResponsesEventReasoningSummaryPartAdded,
+				types.ResponsesEventReasoningSummaryTextDelta,
+				types.ResponsesEventReasoningSummaryTextDone,
+				types.ResponsesEventReasoningSummaryPartDone,
+				types.ResponsesEventOutputItemDone,
+			},
+			// #3 的两条：只发 output_item.done 会让摘要 part 永久悬空。
+			wantDone: []string{
+				types.ResponsesEventReasoningSummaryTextDone,
+				types.ResponsesEventReasoningSummaryPartDone,
+			},
+			text: func(t *testing.T, item map[string]any) string {
+				return respStr(t, respList(t, item, "summary")[0].(map[string]any), "text")
+			},
+			wantText: "thinking hard",
+		},
+		{
+			name:     "function_call 工具参数",
+			lines:    []string{`{"type":"tool-call","toolCallId":"toolu_1","toolName":"get_weather","input":{"city":"San Francisco"}}`},
+			itemType: types.ResponsesItemFunctionCall,
+			lifecycle: []string{
+				types.ResponsesEventOutputItemAdded,
+				types.ResponsesEventFunctionCallArgsDelta,
+				types.ResponsesEventFunctionCallArgsDone,
+				types.ResponsesEventOutputItemDone,
+			},
+			wantDone:   []string{types.ResponsesEventFunctionCallArgsDone},
+			deltaEvent: types.ResponsesEventFunctionCallArgsDelta,
+			text:       func(t *testing.T, item map[string]any) string { return respStr(t, item, "arguments") },
+			wantText:   `{"city":"San Francisco"}`,
+		},
+		{
+			name:     "custom_tool_call 输入",
+			lines:    []string{`{"type":"tool-call","toolCallId":"toolu_2","toolName":"apply_patch","input":{"input":"*** Begin Patch"}}`},
+			itemType: types.ResponsesItemCustomToolCall,
+			lifecycle: []string{
+				types.ResponsesEventOutputItemAdded,
+				types.ResponsesEventCustomToolCallInputDelta,
+				types.ResponsesEventCustomToolCallInputDone,
+				types.ResponsesEventOutputItemDone,
+			},
+			wantDone:   []string{types.ResponsesEventCustomToolCallInputDone},
+			deltaEvent: types.ResponsesEventCustomToolCallInputDelta,
+			text:       func(t *testing.T, item map[string]any) string { return respStr(t, item, "input") },
+			wantText:   "*** Begin Patch",
+		},
+		{
+			name:     "tool_search_call",
+			lines:    []string{`{"type":"tool-call","toolCallId":"toolu_3","toolName":"tool_search","input":{"query":"git","limit":3}}`},
+			itemType: types.ResponsesItemToolSearchCall,
+			// 该块的参数只从 output_item.done 物化，刻意不发任何增量（codex 不消费）。
+			lifecycle: []string{
+				types.ResponsesEventOutputItemAdded,
+				types.ResponsesEventOutputItemDone,
+			},
+			wantDone: nil,
+			text:     func(t *testing.T, item map[string]any) string { return mustJSON(t, item["arguments"]) },
+			wantText: `{"limit":3,"query":"git"}`,
+		},
 	}
+
+	terminations := []responsesTerminationCase{
+		{
+			name:       "正常收尾",
+			extraLines: []string{`{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":10,"outputTokens":5}}`},
+			wantName:   types.ResponsesEventCompleted,
+			wantStatus: types.ResponsesStatusCompleted,
+		},
+		{
+			name:       "流内报错",
+			extraLines: []string{`{"type":"error","error":{"message":"<429> slow down"}}`},
+			wantName:   types.ResponsesEventFailed,
+			wantStatus: types.ResponsesStatusFailed,
+		},
+		{
+			// 上游半截断开：不喂终止事件，也不调 StreamTranslator.Finish。
+			name:       "上游半截断开",
+			truncated:  true,
+			wantName:   types.ResponsesEventCompleted,
+			wantStatus: types.ResponsesStatusCompleted,
+		},
+	}
+
+	for _, b := range blocks {
+		for _, tm := range terminations {
+			t.Run(b.name+" × "+tm.name, func(t *testing.T) {
+				lines := append(append([]string{}, b.lines...), tm.extraLines...)
+				var evs []types.StreamEvent
+				if tm.truncated {
+					evs = respTruncatedStreamEvents(t, lines...)
+				} else {
+					evs = respStreamEvents(t, lines...)
+				}
+				enc := NewResponsesEncoder("test-model", "resp_matrix", respGoldens())
+				names, payloads := respRun(t, enc, evs)
+
+				// 1) 既有不变式检查器（不另写一套）：item 配对、part 成对且不悬空。
+				respAssertItemLifecycle(t, payloads, 1)
+				respAssertPartOrdering(t, payloads)
+				// 2) 矩阵的头号断言：part 先 done、item 后 done。刻意排在序号检查之前——
+				//    顺序被破坏时序号必然也跟着错位，让最具体的那条断言先报错，失败信息才指得准。
+				respAssertPartsClosedBeforeItemDone(t, payloads)
+				respAssertSequence(t, payloads)
+
+				// 3) 块的收尾事件序列：终结路径只决定终态，不该改变块的收尾形状。
+				if got := respLifecycleNames(names); !reflect.DeepEqual(got, b.lifecycle) {
+					t.Errorf("块收尾事件序列（不含 created/in_progress/终态）不对\n got: %v\nwant: %v",
+						got, b.lifecycle)
+				}
+				// 4) 该块必须发出的收尾事件一条不缺。
+				for _, want := range b.wantDone {
+					if !respHasEvent(names, want) {
+						t.Errorf("缺少收尾事件 %s（严格客户端会永久等待该 part/参数收尾）\n got: %v",
+							want, names)
+					}
+				}
+				// 5) 终态事件与 status。
+				if last := names[len(names)-1]; last != tm.wantName {
+					t.Errorf("终态事件 = %s, want %s", last, tm.wantName)
+				}
+				resp := respTerminal(t, payloads)
+				if got := resp["status"]; got != tm.wantStatus {
+					t.Errorf("status = %v, want %s", got, tm.wantStatus)
+				}
+				// 6) 终结前已聚合的产出必须留在 output 里（失败 / 断流同样要能还原）。
+				items := respList(t, resp, "output")
+				if len(items) != 1 {
+					t.Fatalf("output = %d 项, want 1", len(items))
+				}
+				item := items[0].(map[string]any)
+				if item["type"] != b.itemType {
+					t.Fatalf("output[0].type = %v, want %s", item["type"], b.itemType)
+				}
+				if got := b.text(t, item); got != b.wantText {
+					t.Errorf("output[0] 已聚合产出 = %q, want %q", got, b.wantText)
+				}
+				// 7) 参数类块：增量拼接必须恰好等于 done 给出的全文。
+				if b.deltaEvent != "" {
+					joined := respJoinDeltas(payloads, b.deltaEvent, 0)
+					if joined == "" {
+						t.Errorf("%s 没有发出任何增量", b.deltaEvent)
+					} else if joined != b.wantText {
+						t.Errorf("增量拼接 = %q, want done 全文 %q", joined, b.wantText)
+					}
+				}
+			})
+		}
+	}
+}
+
+// respLifecycleNames 取出「块的生命周期」事件名：滤掉流级的 created / in_progress 与终态事件，
+// 并把相邻重复的事件名折叠成一条（参数分片的条数取决于分片粒度，与块的收尾形状无关）。
+func respLifecycleNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	for i, n := range names {
+		switch {
+		case n == types.ResponsesEventCreated, n == types.ResponsesEventInProgress:
+			continue
+		case i == len(names)-1:
+			continue // 终态事件由终结路径决定，不参与「块收尾形状」的比较
+		case len(out) > 0 && out[len(out)-1] == n:
+			continue // 折叠相邻重复的增量
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// respHasEvent 事件名序列里是否存在某一项。
+func respHasEvent(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
 }
 
 // respTruncatedStreamEvents 与 respStreamEvents 同源，但**不**调用 StreamTranslator.Finish：
