@@ -4,7 +4,8 @@ WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/cmdc2api .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/cmdc2api .
 
 FROM alpine:3.22
 RUN adduser -D -u 10001 proxy && mkdir -p /data && chown proxy:proxy /data
