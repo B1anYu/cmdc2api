@@ -43,7 +43,7 @@ func BuildCcRequest(req *types.Request, opts BuildOpts) (*types.CcRequest, []str
 		m := &req.Messages[i]
 		blocks, err := parseBlocks(m.Content)
 		if err != nil {
-			warns = append(warns, fmt.Sprintf("message %d (role %s): content not string/block-array, dropped: %v", i, m.Role, err))
+			warns = append(warns, fmt.Sprintf("message %d (role %s): content not string/block-array, dropped: %v", i, clipWarnValue(m.Role), err))
 			continue
 		}
 		parsed = append(parsed, parsedMessage{
@@ -312,7 +312,7 @@ func convertUser(pm *parsedMessage, toolNames map[string]string, warns *[]string
 			name, known := toolNames[b.ToolUseID]
 			if !known {
 				// 历史记录被裁剪或压缩可能导致孤儿 tool_result（无对应 tool_use），丢弃并记录警告以避免上游校验失败
-				*warns = append(*warns, "orphan tool_result dropped (no matching tool_use in history): "+b.ToolUseID)
+				*warns = append(*warns, "orphan tool_result dropped (no matching tool_use in history): "+clipWarnValue(b.ToolUseID))
 				continue
 			}
 			value, images := toolResultContent(b.Content, warns)
@@ -334,7 +334,7 @@ func convertUser(pm *parsedMessage, toolNames map[string]string, warns *[]string
 		case "document":
 			*warns = append(*warns, "document block dropped (upstream has no document part)")
 		default:
-			*warns = append(*warns, "unknown user block type dropped: "+b.Type)
+			*warns = append(*warns, "unknown user block type dropped: "+clipWarnValue(b.Type))
 		}
 	}
 	flushUser()
@@ -405,7 +405,7 @@ func convertAssistant(pm *parsedMessage, opts BuildOpts, warns *[]string) []type
 		case "image":
 			*warns = append(*warns, "image block in assistant message dropped")
 		default:
-			*warns = append(*warns, "unknown assistant block type dropped: "+b.Type)
+			*warns = append(*warns, "unknown assistant block type dropped: "+clipWarnValue(b.Type))
 		}
 	}
 	if thinkingDropped {
@@ -514,7 +514,7 @@ func convertTools(tools []types.Tool, warns *[]string) ([]types.CcTool, bool) {
 	if len(replaced) > 0 {
 		*warns = append(*warns, fmt.Sprintf(
 			"tool input_schema replaced with {\"type\":\"object\",\"properties\":{}} for %d tool(s) [%s]: the cmdc envelope requires input_schema to be an object and these were not (top-level anyOf/oneOf, \"type\" missing or not \"object\", or invalid JSON). The model now sees them as parameterless tools, so their calls may arrive with empty or missing arguments — if one of them is affected and you need its real parameters, check the client-side tool declaration.",
-			len(replaced), strings.Join(replaced, ", ")))
+			len(replaced), clipWarnValue(strings.Join(replaced, ", "))))
 	}
 	return out, hadCC
 }
@@ -574,8 +574,8 @@ func convertToolChoice(raw json.RawMessage, warns *[]string) (*types.CcToolChoic
 		choice = &types.CcToolChoice{Type: tc.Type, Name: tc.Name}
 	default:
 		*warns = append(*warns, fmt.Sprintf(
-			"tool_choice type %q is not one of auto/any/tool/none: it was downgraded to {\"type\":\"auto\"}, so the model may now call any tool (or none) instead of being constrained as the client asked. (This silent downgrade is reachable only from the Anthropic Messages inbound path; /v1/chat/completions and /v1/responses normalize tool_choice in their own inbound layer and already log the unknown value there.)",
-			tc.Type))
+			"tool_choice type %q is not one of auto/any/tool/none: it was downgraded to {\"type\":\"auto\"}, so the model may now call any tool (or none) instead of being constrained as the client asked. (Only the Anthropic Messages inbound path reaches this branch; /v1/chat/completions and /v1/responses normalize tool_choice in their own inbound layer and already log the unknown value there.)",
+			clipWarnValue(tc.Type)))
 		choice = &types.CcToolChoice{Type: "auto"}
 	}
 	var parallel *bool
@@ -647,5 +647,5 @@ func synthesizeCacheMarker(msgs []types.CcMessage, need, force bool, warns *[]st
 			}
 		}
 	}
-	*warns = append(*warns, "cache_control present on system/tools but no text part to carry the marker")
+	*warns = append(*warns, "no text part in the envelope can carry a cache breakpoint, so none was synthesized. The inbound request carried no usable part-level marker — either it declared cache_control only on system/tools, which the cmdc envelope has no field to carry, or its protocol has no cache_control field at all (OpenAI Chat/Responses) — and the envelope's tail has no text part to attach one to. This request goes upstream with no part-level breakpoint; only session affinity can still reach the cache.")
 }

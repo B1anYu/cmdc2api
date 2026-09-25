@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/B1anYu/cmdc2api/internal/types"
 )
@@ -176,25 +177,74 @@ func aggregateRequestWarns(warns []string) []string {
 	return out
 }
 
-// chatWarnFamilyKey 生成聚合键：连续数字段折叠为单个 '#'（message 索引等只有定位价值，
-// 不参与家族判定）。
+// chatWarnFamilyKey 生成聚合键：把「含数字的标识符串」折成一个 '#'，引号内的内容不折。
+//
+// 两条取舍都是实测出来的：
+//   - 折「整段标识符」而不是「连续数字」：toolu_01Ab3 与 toolu_02Cd7 只差数字与字母，
+//     只折数字会得到 toolu_#Ab# 与 toolu_#Cd#，仍然分家。而 unanswered tool_use dropped
+//     那一族正是按历史逐条复发、要靠聚合收成一条的。
+//   - 引号内不折：工具名/字段名一律以 %q 嵌进文案（见 A′ 的文案口径），工具名带数字是常态
+//     （t1/t2），折了会把不同的工具并成一族。
 func chatWarnFamilyKey(w string) string {
 	var b strings.Builder
 	b.Grow(len(w))
-	inDigits := false
-	for i := 0; i < len(w); i++ {
-		c := w[i]
-		if c >= '0' && c <= '9' {
-			if !inDigits {
-				b.WriteByte('#')
-				inDigits = true
+	for i := 0; i < len(w); {
+		if w[i] == '"' {
+			j := i + 1
+			for j < len(w) && w[j] != '"' {
+				j++
 			}
+			if j < len(w) {
+				j++ // 含收尾引号
+			}
+			b.WriteString(w[i:j])
+			i = j
 			continue
 		}
-		inDigits = false
-		b.WriteByte(c)
+		if warnIdentByte(w[i]) {
+			j, hasDigit := i, false
+			for j < len(w) && warnIdentByte(w[j]) {
+				if w[j] >= '0' && w[j] <= '9' {
+					hasDigit = true
+				}
+				j++
+			}
+			if hasDigit {
+				b.WriteByte('#')
+			} else {
+				b.WriteString(w[i:j])
+			}
+			i = j
+			continue
+		}
+		b.WriteByte(w[i])
+		i++
 	}
 	return b.String()
+}
+
+// warnIdentByte 标识符字符：字母、数字、下划线。工具名、调用 id、消息索引都落在这一类。
+func warnIdentByte(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+}
+
+// warnValueMax 是嵌入留痕的客户端可控文本的字节上限。
+//
+// 留痕会把客户端原文写进日志，而请求体上限默认 100MB（CC_MAX_BODY_MB），聚合的明细列表
+// 又会把同族留痕再复制最多 3 份——不加限，单行日志可以到请求体的数倍，且内容完全由客户端控制。
+// 超出部分截断并注明原始长度，便于判断客户端到底发了多大一坨。
+const warnValueMax = 200
+
+// clipWarnValue 截断要嵌进留痕的客户端可控文本（按字节，且不切断 UTF-8）。
+func clipWarnValue(s string) string {
+	if len(s) <= warnValueMax {
+		return s
+	}
+	cut := warnValueMax
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf("…(truncated, %d bytes total)", len(s))
 }
 
 // limitWarnDetails 截断明细列表（超出部分以计数收尾）。
@@ -379,7 +429,7 @@ func chatMessageText(idx int, m *types.ChatMessage, warns *[]string) string {
 	text, parts, err := parseChatContent(m.Content)
 	if err != nil {
 		*warns = append(*warns, fmt.Sprintf(
-			"message %d (%s): content is neither string nor part array; the whole system text of this message is dropped (this is a malformed content value, not an empty one)", idx, m.Role))
+			"message %d (%s): content is neither string nor part array; the whole system text of this message is dropped (this is a malformed content value, not an empty one)", idx, clipWarnValue(m.Role)))
 		return ""
 	}
 	if parts == nil {
@@ -398,7 +448,7 @@ func chatMessageText(idx int, m *types.ChatMessage, warns *[]string) string {
 	if len(ignored) > 0 {
 		*warns = append(*warns, fmt.Sprintf(
 			"message %d (%s): %d non-text content part(s) ignored [%s]; the upstream system prompt is text-only, so this much of the system instruction is not sent and the model never sees it",
-			idx, m.Role, len(ignored), strings.Join(ignored, ", ")))
+			idx, clipWarnValue(m.Role), len(ignored), clipWarnValue(strings.Join(ignored, ", "))))
 	}
 	return strings.Join(texts, "\n")
 }
@@ -444,7 +494,7 @@ func chatUserBlocks(idx int, m *types.ChatMessage, warns *[]string) []types.Bloc
 				}
 				blocks = append(blocks, types.Block{Type: "image", Source: src})
 			default:
-				*warns = append(*warns, fmt.Sprintf("message %d (user): unsupported content part %q dropped", idx, p.Type))
+				*warns = append(*warns, fmt.Sprintf("message %d (user): unsupported content part %q dropped", idx, clipWarnValue(p.Type)))
 			}
 		}
 	}
@@ -511,7 +561,7 @@ func chatAssistantBlocks(idx int, m *types.ChatMessage, warns *[]string) []types
 				}
 				continue
 			}
-			*warns = append(*warns, fmt.Sprintf("message %d (assistant): unsupported content part %q dropped", idx, p.Type))
+			*warns = append(*warns, fmt.Sprintf("message %d (assistant): unsupported content part %q dropped", idx, clipWarnValue(p.Type)))
 		}
 	}
 
@@ -534,7 +584,7 @@ func chatAssistantBlocks(idx int, m *types.ChatMessage, warns *[]string) []types
 			// ID/Type/Function，没有 Custom/Computer 字段，那种调用的 Function.Name 必为空，
 			// 由下面的「without function name」分支连内容一起留痕丢弃。
 			*warns = append(*warns, fmt.Sprintf(
-				"message %d (assistant): tool_call %q declares type %q instead of \"function\"; converted as a function call anyway because its payload is in function.name/function.arguments", idx, tc.Function.Name, tc.Type))
+				"message %d (assistant): tool_call %q declares type %q instead of \"function\"; converted as a function call anyway because its payload is in function.name/function.arguments", idx, clipWarnValue(tc.Function.Name), clipWarnValue(tc.Type)))
 		}
 		if tc.Function.Name == "" {
 			*warns = append(*warns, fmt.Sprintf("message %d (assistant): tool_call without function name dropped", idx))
@@ -542,7 +592,7 @@ func chatAssistantBlocks(idx int, m *types.ChatMessage, warns *[]string) []types
 		}
 		if tc.ID == "" {
 			// 没有 id 就无法与 tool 消息配对，配对修复阶段也只会把它当悬空调用丢掉
-			*warns = append(*warns, fmt.Sprintf("message %d (assistant): tool_call %q without id dropped", idx, tc.Function.Name))
+			*warns = append(*warns, fmt.Sprintf("message %d (assistant): tool_call %q without id dropped", idx, clipWarnValue(tc.Function.Name)))
 			continue
 		}
 		toolUses = append(toolUses, types.Block{
@@ -612,13 +662,13 @@ func chatToolArgsReport(tool, args string, warns *[]string) json.RawMessage {
 	}
 	if !json.Valid([]byte(trimmed)) {
 		*warns = append(*warns, fmt.Sprintf(
-			"tool call %q: arguments are not valid JSON; replaced with {} and the original text is lost (the model's call now arrives with empty arguments)", tool))
+			"tool call %q: arguments are not valid JSON; replaced with {} and the original text is lost (the model's call now arrives with empty arguments)", clipWarnValue(tool)))
 		return json.RawMessage("{}")
 	}
 	// 合法 JSON 且以 '{' 开头 ⟺ 是 object（合法 JSON 的其它形态不会以 '{' 开头）。
 	if trimmed[0] != '{' {
 		*warns = append(*warns, fmt.Sprintf(
-			"tool call %q: arguments are valid JSON but not an object (%s); passed through unchanged because the upstream accepts only objects here — this call may be rejected upstream", tool, trimmed))
+			"tool call %q: arguments are valid JSON but not an object (%s); passed through unchanged because the upstream accepts only objects here — this call may be rejected upstream", clipWarnValue(tool), clipWarnValue(trimmed)))
 	}
 	return json.RawMessage(trimmed)
 }
@@ -675,7 +725,7 @@ func chatToolResultContent(idx int, raw json.RawMessage, warns *[]string) json.R
 			}
 			blocks = append(blocks, types.Block{Type: "image", Source: src})
 		default:
-			*warns = append(*warns, fmt.Sprintf("message %d (tool): unsupported content part %q dropped", idx, p.Type))
+			*warns = append(*warns, fmt.Sprintf("message %d (tool): unsupported content part %q dropped", idx, clipWarnValue(p.Type)))
 		}
 	}
 	if len(blocks) == 0 {
@@ -696,7 +746,7 @@ func chatTools(tools []types.ChatTool, warns *[]string) []types.Tool {
 	for i := range tools {
 		t := &tools[i]
 		if t.Type != "" && t.Type != "function" {
-			*warns = append(*warns, fmt.Sprintf("tool %d (%s): unsupported tool type %q dropped", i, chatToolName(t), t.Type))
+			*warns = append(*warns, fmt.Sprintf("tool %d (%s): unsupported tool type %q dropped", i, clipWarnValue(chatToolName(t)), clipWarnValue(t.Type)))
 			continue
 		}
 		if t.Function == nil || t.Function.Name == "" {
@@ -704,7 +754,7 @@ func chatTools(tools []types.ChatTool, warns *[]string) []types.Tool {
 			continue
 		}
 		if t.Function.Strict != nil && *t.Function.Strict {
-			*warns = append(*warns, fmt.Sprintf("tool %s: strict schema flag dropped (upstream has no strict-schema mode)", t.Function.Name))
+			*warns = append(*warns, fmt.Sprintf("tool %s: strict schema flag dropped (upstream has no strict-schema mode)", clipWarnValue(t.Function.Name)))
 		}
 		out = append(out, types.Tool{
 			Name:        t.Function.Name,
@@ -744,7 +794,7 @@ func chatToolChoice(raw json.RawMessage, hasTools bool, warns *[]string) json.Ra
 		case "required":
 			return chatJSON(types.CcToolChoice{Type: "any"})
 		default:
-			*warns = append(*warns, fmt.Sprintf("unknown tool_choice %q; falling back to auto", s))
+			*warns = append(*warns, fmt.Sprintf("unknown tool_choice %q; falling back to auto", clipWarnValue(s)))
 			return chatJSON(types.CcToolChoice{Type: "auto"})
 		}
 	}
@@ -782,7 +832,7 @@ func chatToolChoice(raw json.RawMessage, hasTools bool, warns *[]string) json.Ra
 		*warns = append(*warns, "tool_choice allowed_tools downgraded to auto (upstream cannot express an allow-list)")
 		return chatJSON(types.CcToolChoice{Type: "auto"})
 	default:
-		*warns = append(*warns, fmt.Sprintf("unknown tool_choice type %q; falling back to auto", tc.Type))
+		*warns = append(*warns, fmt.Sprintf("unknown tool_choice type %q; falling back to auto", clipWarnValue(tc.Type)))
 		return chatJSON(types.CcToolChoice{Type: "auto"})
 	}
 }
@@ -824,7 +874,7 @@ func chatReasoningEffort(raw json.RawMessage, warns *[]string) string {
 	case "minimal":
 		return "low"
 	default:
-		*warns = append(*warns, fmt.Sprintf("unknown reasoning_effort %q ignored", effort))
+		*warns = append(*warns, fmt.Sprintf("unknown reasoning_effort %q ignored", clipWarnValue(effort)))
 		return ""
 	}
 }

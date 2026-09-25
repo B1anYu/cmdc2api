@@ -1070,7 +1070,8 @@ func TestChatToRequest_WarnAggregationKeepsFamiliesApart(t *testing.T) {
 	}
 }
 
-// 聚合是请求内行为：留痕键只折叠数字，不同工具名仍各自成条。
+// 聚合是请求内行为：留痕键折叠「含数字的标识符串」但不动引号内的内容，
+// 所以不同工具名（引号内）仍各自成条。键法本身由 TestChatWarnFamilyKey 覆盖。
 func TestChatToRequest_WarnAggregationKeepsDistinctTools(t *testing.T) {
 	_, warns := mustChatToRequest(t, chatReq(t, `{"model":"m","messages":[
 		{"role":"user","content":"q"},

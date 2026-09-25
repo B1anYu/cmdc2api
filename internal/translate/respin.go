@@ -239,7 +239,9 @@ func responsesInput(raw json.RawMessage) ([]types.ResponsesInputItem, string, er
 	}
 	var items []types.ResponsesInputItem
 	if err := json.Unmarshal(raw, &items); err != nil {
-		return nil, "", errors.New("input must be a string or an array of input items")
+		// 带上底层错误：逐项字段类型不对时只报「input 形状不对」，会把客户端引到它明明
+		// 写对了的 input 结构上，而真正出问题的是某个 item 的某个字段。
+		return nil, "", fmt.Errorf("input must be a string or an array of input items: %w", err)
 	}
 	return items, "", nil
 }
@@ -292,7 +294,7 @@ func (s *respinState) convertItem(idx int, item *types.ResponsesInputItem) {
 	case "tool_search_output":
 		s.convertToolSearchOutput(idx, item)
 	default:
-		s.warnf("input item %d: unsupported type %q dropped", idx, item.Type)
+		s.warnf("input item %d: unsupported type %q dropped", idx, clipWarnValue(item.Type))
 	}
 }
 
@@ -316,7 +318,7 @@ func (s *respinState) convertMessageItem(idx int, item *types.ResponsesInputItem
 		// 未知 role 兜底为 user（保留内容），而不是整条丢弃：CC 的信封只有 user/assistant
 		// 两种角色，丢掉这条就把客户端历史里的一段内容从模型视野里抹掉了。
 		// 口径与 A 级参照 proxy.mjs 的 `{role:'user', content:[{type:'text', text:...}]}` 一致。
-		s.warnf("input item %d: unknown role %q downgraded to a user message (upstream accepts user/assistant roles only; its content is kept)", idx, item.Role)
+		s.warnf("input item %d: unknown role %q downgraded to a user message (upstream accepts user/assistant roles only; its content is kept)", idx, clipWarnValue(item.Role))
 		if blocks := s.userBlocks(idx, item.Content); len(blocks) > 0 {
 			s.msgs = append(s.msgs, types.InboundMessage{Role: "user", Content: InboundBlocksContent(blocks)})
 		}
@@ -328,14 +330,14 @@ func (s *respinState) convertMessageItem(idx int, item *types.ResponsesInputItem
 // 出站才能按同一约定解包还原成 custom_tool_call 的裸字符串。
 func (s *respinState) convertToolCallItem(idx int, item *types.ResponsesInputItem) {
 	if item.Name == "" {
-		s.warnf("input item %d (%s): tool call without name dropped", idx, item.Type)
+		s.warnf("input item %d (%s): tool call without name dropped", idx, clipWarnValue(item.Type))
 		return
 	}
 	if item.CallID == "" {
 		// 没有 call_id 的调用无法与结果配对，配对修复阶段也只会把它当悬空调用清掉，
 		// 这里提前丢弃并说清原因。
 		s.warnf("input item %d (%s): tool call %q without call_id dropped (cannot pair with its output)",
-			idx, item.Type, item.Name)
+			idx, clipWarnValue(item.Type), clipWarnValue(item.Name))
 		return
 	}
 	input := chatToolArgsReport(item.Name, item.Arguments, &s.warns) // 空串兜底 {}；非法 JSON 与非 object 留痕
@@ -354,7 +356,7 @@ func (s *respinState) convertToolCallItem(idx int, item *types.ResponsesInputIte
 func (s *respinState) convertToolOutputItem(idx int, item *types.ResponsesInputItem) {
 	if item.CallID == "" {
 		s.warnf("input item %d (%s): missing call_id, dropped (cannot be paired with a tool call)",
-			idx, item.Type)
+			idx, clipWarnValue(item.Type))
 		return
 	}
 	s.msgs = append(s.msgs, types.InboundMessage{
@@ -400,7 +402,7 @@ func (s *respinState) toolResultContent(idx int, raw json.RawMessage) json.RawMe
 			}
 			blocks = append(blocks, types.Block{Type: "image", Source: src})
 		default:
-			s.warnf("input item %d: unsupported tool output part %q dropped", idx, p.Type)
+			s.warnf("input item %d: unsupported tool output part %q dropped", idx, clipWarnValue(p.Type))
 		}
 	}
 	if len(blocks) == 0 {
@@ -435,7 +437,7 @@ func (s *respinState) convertToolSearchOutput(idx int, item *types.ResponsesInpu
 	// 认下它会与上一行的注释自相矛盾）。
 	if item.Status != types.ResponsesStatusCompleted {
 		s.warnf("input item %d: tool_search_output with status %q not promoted (only completed results are promoted; a missing status is not treated as completed, so the tools it discovered are not declared upstream)",
-			idx, item.Status)
+			idx, clipWarnValue(item.Status))
 		return
 	}
 	tools, err := responsesToolList(item.Tools)
@@ -673,7 +675,7 @@ func (t *respinToolSet) declare(list []types.ResponsesTool, origin string, dedup
 		switch tool.Type {
 		case "", types.ResponsesToolFunction:
 			if tool.Name == "" {
-				*warns = append(*warns, fmt.Sprintf("tool %d (%s): function without name dropped", i, origin))
+				*warns = append(*warns, fmt.Sprintf("tool %d (%s): function without name dropped", i, clipWarnValue(origin)))
 				continue
 			}
 			if tool.Strict != nil && *tool.Strict {
@@ -687,7 +689,7 @@ func (t *respinToolSet) declare(list []types.ResponsesTool, origin string, dedup
 
 		case types.ResponsesToolCustom:
 			if tool.Name == "" {
-				*warns = append(*warns, fmt.Sprintf("tool %d (%s): custom tool without name dropped", i, origin))
+				*warns = append(*warns, fmt.Sprintf("tool %d (%s): custom tool without name dropped", i, clipWarnValue(origin)))
 				continue
 			}
 			if err := t.add(tool.Name, tool.Description, origin,
@@ -726,10 +728,10 @@ func (t *respinToolSet) declare(list []types.ResponsesTool, origin string, dedup
 func (t *respinToolSet) declareNamespace(ns *types.ResponsesTool, origin string, dedupe bool,
 	mapping *ResponsesToolMapping, warns *[]string) error {
 	if ns.Name == "" {
-		*warns = append(*warns, fmt.Sprintf("namespace tool without name dropped (%s)", origin))
+		*warns = append(*warns, fmt.Sprintf("namespace tool without name dropped (%s)", clipWarnValue(origin)))
 		return nil
 	}
-	nsOrigin := fmt.Sprintf("namespace %q", ns.Name)
+	nsOrigin := fmt.Sprintf("namespace %q", clipWarnValue(ns.Name))
 	for j := range ns.Tools {
 		child := &ns.Tools[j]
 		if child.Name == "" {
@@ -918,7 +920,7 @@ func responsesToolChoice(raw json.RawMessage, hasTools bool, warns *[]string) js
 		case "required":
 			return chatJSON(types.CcToolChoice{Type: "any"})
 		default:
-			*warns = append(*warns, fmt.Sprintf("unknown tool_choice %q; falling back to auto", s))
+			*warns = append(*warns, fmt.Sprintf("unknown tool_choice %q; falling back to auto", clipWarnValue(s)))
 			return chatJSON(types.CcToolChoice{Type: "auto"})
 		}
 	}
@@ -957,7 +959,7 @@ func responsesToolChoice(raw json.RawMessage, hasTools bool, warns *[]string) js
 			"tool_choice allowed_tools downgraded to auto (upstream cannot express an allow-list)")
 		return chatJSON(types.CcToolChoice{Type: "auto"})
 	default:
-		*warns = append(*warns, fmt.Sprintf("unknown tool_choice type %q; falling back to auto", tc.Type))
+		*warns = append(*warns, fmt.Sprintf("unknown tool_choice type %q; falling back to auto", clipWarnValue(tc.Type)))
 		return chatJSON(types.CcToolChoice{Type: "auto"})
 	}
 }

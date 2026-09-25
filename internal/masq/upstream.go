@@ -32,6 +32,11 @@ type Upstream struct {
 
 	// modelsCache 按 apiKey 分开存：不同 key 的可见模型集可能不同（且无 key 走兜底列表），
 	// 共用一份会让无 key / 其它 key 的请求命中别的 key 拉回来的列表。
+	//
+	// 条目本身不设上限、也不主动清理（modelsTTL 只管刷新，不管条目存在与否）：新增条目的
+	// 前提是上游对这个 key 返回了 200 且 data 非空，所以扩容需要上游认可的 key，不是客户端
+	// 可以随意触发的。形态上无界、实践上有界，故有意如此——若将来改成「未验证的 key 也写
+	// 条目」或上游开始对任意 key 回 200，这个前提就没了，届时必须补淘汰。
 	modelsMu    sync.Mutex
 	modelsCache map[string]cachedModels
 }
