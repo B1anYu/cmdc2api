@@ -497,10 +497,14 @@ func TestEndToEnd_NotFoundShapeByPath(t *testing.T) {
 		openAI bool
 	}{
 		{"/v1/messages/nope", false},
+		{"/messages/nope", false},
 		{"/v1/models/nope", false},
+		{"/models/nope", false},
 		{"/nope", false},
 		{"/v1/chat/completions/nope", true},
+		{"/chat/completions/nope", true},
 		{"/v1/responses/nope", true},
+		{"/responses/nope", true},
 	}
 	f := newFakeCC(t)
 	proxy := newProxy(t, f, nil)
@@ -659,8 +663,11 @@ func TestMissingAPIKeyMessageMentionsUserPrefix(t *testing.T) {
 
 	cases := []struct{ name, path, body string }{
 		{"messages", "/v1/messages", anthropicReq},
+		{"messages_alias", "/messages", anthropicReq},
 		{"chat", "/v1/chat/completions", chatRequestBody(false)},
+		{"chat_alias", "/chat/completions", chatRequestBody(false)},
 		{"responses", "/v1/responses", responsesBody(false, "")},
+		{"responses_alias", "/responses", responsesBody(false, "")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -777,3 +784,47 @@ func TestEndToEnd_ModelsCacheIsPerKey(t *testing.T) {
 		t.Errorf("upstream models calls = %d, want 2 (A/B 各一次；同 key 复取走缓存)", modelsCalls)
 	}
 }
+
+// TestRouteAliases_E2E 验证无 /v1 前缀的别名端点与标准 /v1 端点同等正常工作（支持下游 Base URL 不带 /v1）
+func TestRouteAliases_E2E(t *testing.T) {
+	f := newFakeCC(t)
+	proxy := newProxy(t, f, nil)
+	auth := map[string]string{"Authorization": "Bearer user_testkey"}
+
+	// 1. GET /models 别名
+	req, err := http.NewRequest(http.MethodGet, proxy.URL+"/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer user_testkey")
+	resp, err := proxy.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /models status = %d, want 200", resp.StatusCode)
+	}
+
+	// 2. POST /messages 别名
+	respMessages := postJSONPath(t, proxy, "/messages", anthropicReq, auth)
+	defer func() { _ = respMessages.Body.Close() }()
+	if respMessages.StatusCode != http.StatusOK {
+		t.Fatalf("POST /messages status = %d, want 200", respMessages.StatusCode)
+	}
+
+	// 3. POST /chat/completions 别名
+	respChat := postJSONPath(t, proxy, "/chat/completions", chatRequestBody(false), auth)
+	defer func() { _ = respChat.Body.Close() }()
+	if respChat.StatusCode != http.StatusOK {
+		t.Fatalf("POST /chat/completions status = %d, want 200", respChat.StatusCode)
+	}
+
+	// 4. POST /responses 别名
+	respResponses := postJSONPath(t, proxy, "/responses", responsesBody(false, ""), auth)
+	defer func() { _ = respResponses.Body.Close() }()
+	if respResponses.StatusCode != http.StatusOK {
+		t.Fatalf("POST /responses status = %d, want 200", respResponses.StatusCode)
+	}
+}
+

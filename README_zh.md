@@ -132,11 +132,13 @@ curl http://127.0.0.1:8050/v1/chat/completions \
 
 | 路径 | 方法 | 说明 |
 |---|---|---|
-| `/v1/messages` | `POST` | Anthropic Messages 接口（支持流式 SSE 与非流式 JSON） |
-| `/v1/responses` | `POST` | OpenAI Responses 接口（面向 Codex CLI 深度适配，支持流式 SSE 与非流式 JSON） |
-| `/v1/chat/completions` | `POST` | OpenAI Chat Completions 接口（标准对话补全，支持流式 SSE 与非流式 JSON） |
-| `/v1/models` | `GET` | 模型列表（Anthropic 与 OpenAI 格式超集；携带 Key 时透传上游，否则回退至内置列表） |
-| `/health` | `GET` | 健康检查端点 |
+| `/v1/messages`, `/messages` | `POST` | Anthropic Messages 接口（支持流式 SSE 与非流式 JSON） |
+| `/v1/responses`, `/responses` | `POST` | OpenAI Responses 接口（面向 Codex CLI 深度适配，支持流式 SSE 与非流式 JSON） |
+| `/v1/chat/completions`, `/chat/completions` | `POST` | OpenAI Chat Completions 接口（标准对话补全，支持流式 SSE 与非流式 JSON） |
+| `/v1/models`, `/models` | `GET` | 模型列表（Anthropic 与 OpenAI 格式超集；携带 Key 时透传上游，否则回退至内置列表） |
+| `/health`, `/` | `GET` | 健康检查端点 |
+
+> **关于 Base URL 兼容性说明**：所有协议端点均同时挂载 `/v1/*` 与无前缀别名（如 `/chat/completions`），下游客户端无论配置 Base URL 为 `http://127.0.0.1:8050` 还是 `http://127.0.0.1:8050/v1` 均能直接兼容。
 
 **鉴权头**：
 - 支持 `Authorization: Bearer user_xxx` 或 `x-api-key: user_xxx` 请求头。
@@ -191,12 +193,13 @@ Codex CLI 对 Responses 规范的校验极度严格：
 
 ### 4. 会话亲和与缓存优化（Prompt Cache）
 
-cmdc 上游的 Prompt Cache 依赖会话（Session）粒度运作。代理结合三层机制实现高命中率：
+cmdc 上游的 Prompt Cache 依赖会话（Session）粒度运作。代理结合四层优先级机制实现高命中率：
 
-1. **显式会话头优先**：若请求头包含 `x-session-id`、`x-claude-code-session-id` 或 `session_id`（长度 ≥ 8），直接作为上游会话 ID。
-2. **前缀哈希派生（默认）**：无显式头时，由 `sha256(system + tools + 首条用户消息)` 计算生成稳定 UUID 格式的会话 ID。同一轮对话跨轮次天然复用同一会话；当系统提示词、工具集或初始上下文发生压缩/变更时自动迁移。
-3. **内容级与末尾缓存断点**：
-   - 消息内容块上的 `cache_control` 原位保留（归一化为 `{type: "ephemeral"}`）。
+1. **显式会话头优先**：若请求头包含 `x-session-id`、`x-claude-code-session-id` 或 `session_id`（长度 ≥ 8），直接派生并格式化为上游会话 ID。
+2. **客户端声明缓存键（`prompt_cache_key`）**：OpenAI Chat / Responses 端点支持客户端显式传递 `prompt_cache_key`（长度 ≥ 8），比派生哈希更权威表达客户端意图。
+3. **前缀哈希派生（默认）**：无显式标识时，由 `sha256(system + tools + 首条用户消息)` 计算生成稳定 UUID 格式的会话 ID。同一轮对话跨轮次天然复用同一会话；当系统提示词、工具集或初始上下文发生压缩/变更时自动迁移。
+4. **内容级与末尾缓存断点**：
+   - 消息内容块上的 `cache_control`（含 `ttl`）原样透传。
    - `system` 与 `tools` 上的缓存标记折算为在**信封最末尾**的最后一个文本块上合成标记（从整条对话历史末尾向前回扫，跨越工具交互轮次），确保缓存能够覆盖除最新一轮外的所有历史上下文。
 
 ### 5. 客户端拟真伪装

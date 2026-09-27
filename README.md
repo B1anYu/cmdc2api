@@ -128,11 +128,13 @@ curl http://127.0.0.1:8050/v1/chat/completions \
 
 | Path | Method | Description |
 |---|---|---|
-| `/v1/messages` | `POST` | Anthropic Messages endpoint (streaming SSE & non-streaming JSON) |
-| `/v1/responses` | `POST` | OpenAI Responses endpoint (optimized for Codex CLI, streaming SSE & non-streaming JSON) |
-| `/v1/chat/completions` | `POST` | OpenAI Chat Completions endpoint (streaming SSE & non-streaming JSON) |
-| `/v1/models` | `GET` | Model list (superset of Anthropic & OpenAI formats; forwarded upstream when authenticated) |
-| `/health` | `GET` | Health check endpoint |
+| `/v1/messages`, `/messages` | `POST` | Anthropic Messages endpoint (streaming SSE & non-streaming JSON) |
+| `/v1/responses`, `/responses` | `POST` | OpenAI Responses endpoint (optimized for Codex CLI, streaming SSE & non-streaming JSON) |
+| `/v1/chat/completions`, `/chat/completions` | `POST` | OpenAI Chat Completions endpoint (streaming SSE & non-streaming JSON) |
+| `/v1/models`, `/models` | `GET` | Model list (superset of Anthropic & OpenAI formats; forwarded upstream when authenticated) |
+| `/health`, `/` | `GET` | Health check endpoint |
+
+> **Note on Base URL Compatibility**: All protocol endpoints support both `/v1/*` and non-prefix aliases (e.g. `/chat/completions`). Downstream clients will work seamlessly whether their Base URL is configured as `http://127.0.0.1:8050` or `http://127.0.0.1:8050/v1`.
 
 **Authentication Headers**:
 - Supports `Authorization: Bearer user_xxx` or `x-api-key: user_xxx` headers.
@@ -187,12 +189,13 @@ Codex CLI expects strict conformances to the Responses specification:
 
 ### 4. Cache Affinity & Prompt Cache Optimization
 
-cmdc's Prompt Cache operates at session granularity. The proxy orchestrates three tiers of cache affinity:
+cmdc's Prompt Cache operates at session granularity. The proxy orchestrates four tiers of cache affinity:
 
-1. **Explicit Session Headers**: If the request contains `x-session-id`, `x-claude-code-session-id`, or `session_id` (length ≥ 8), it is used directly as the upstream session ID.
-2. **Prefix Derivation (Default)**: In the absence of an explicit header, a stable UUID-formatted session ID is calculated from `sha256(system + tools + first_user_message)`. Conversations reuse the exact same upstream session across turns, automatically rotating only when system prompts, toolsets, or compressed contexts change.
-3. **Content-level & Tail Cache Breakpoints**:
-   - Native `cache_control` annotations on content blocks are preserved (normalized to `{type: "ephemeral"}`).
+1. **Explicit Session Headers**: If the request contains `x-session-id`, `x-claude-code-session-id`, or `session_id` (length ≥ 8), it is formatted and used as the upstream session ID.
+2. **Explicit Client Cache Key (`prompt_cache_key`)**: OpenAI Chat / Responses clients can explicitly declare `prompt_cache_key` (length ≥ 8), taking precedence over derived heuristics.
+3. **Prefix Derivation (Default)**: In the absence of explicit identifiers, a stable UUID-formatted session ID is calculated from `sha256(system + tools + first_user_message)`. Conversations reuse the exact same upstream session across turns, automatically rotating only when system prompts, toolsets, or compressed contexts change.
+4. **Content-level & Tail Cache Breakpoints**:
+   - Native `cache_control` annotations on content blocks (including `ttl`) pass through unchanged.
    - Breakpoints on `system` and `tools` are folded into a synthesized marker on the **very last text part of the envelope** (scanned backwards from the entire conversation tail across tool turns), ensuring cached prefix coverage over all prior history.
 
 ### 5. High-fidelity Client Masquerade
@@ -224,7 +227,7 @@ total_tokens  = prompt_tokens + output_tokens
 ## Known Limitations & Fallbacks
 
 - **System Prompt Format**: cmdc strictly enforces `params.system` as a plain string (array payloads are rejected with HTTP 400). Structured system blocks are concatenated into text, with cache markers mapped to the tail.
-- **Thinking Signature Deterministic Forgery**: Because third-party proxies cannot mint official cryptographic signatures, signatures are deterministically generated via `0x12` + sha256 prefix, ensuring stable signatures for identical thinking blocks while passing client-side shallow validation.
+- **Thinking Signature Deterministic Forgery**: Because third-party proxies cannot mint official cryptographic signatures, signatures are deterministically generated via `0x12` + sha256 prefix, ensuring stable signatures for identical thinking blocks while passing client-side shallow validation. Responses egress sends forged signatures via `encrypted_content` for Codex CLI replay, which are safely parsed back to plain thinking blocks and stripped before forwarding upstream.
 - **Unsupported Inbound Fields**: Fields without upstream counterparts are safely dropped with logs (e.g. `stop_sequences`, `top_k`, `metadata.user_id`, and `tool_result.is_error`). Responses and Chat endpoints also reject unsupported features like `previous_response_id` and `n > 1` with explicit 400 errors.
 
 ---

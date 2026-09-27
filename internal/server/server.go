@@ -38,10 +38,18 @@ func (s *Server) CleanupSessions() { s.sessions.Cleanup() }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// 标准 /v1/* 路径
 	mux.HandleFunc("POST /v1/messages", s.handleMessages)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("POST /v1/responses", s.handleResponses)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
+
+	// 别名兼容（支持客户端 Base URL 不带 /v1 前缀）
+	mux.HandleFunc("POST /messages", s.handleMessages)
+	mux.HandleFunc("POST /chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("POST /responses", s.handleResponses)
+	mux.HandleFunc("GET /models", s.handleModels)
+
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /{$}", handleHealth)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -139,9 +147,10 @@ func writePathError(w http.ResponseWriter, r *http.Request, status int, errType,
 }
 
 // isOpenAIErrorPath 判断路径是否属于 OpenAI 形状端点。
-// 前缀匹配而非等值匹配：带上尾部子路径（如 /v1/chat/completions/xxx）仍按该协议出口。
+// 前缀匹配而非等值匹配：带上尾部子路径（如 /v1/chat/completions/xxx 或 /chat/completions/xxx）仍按该协议出口。
 func isOpenAIErrorPath(path string) bool {
-	return strings.HasPrefix(path, "/v1/responses") || strings.HasPrefix(path, "/v1/chat/completions")
+	p := strings.TrimPrefix(path, "/v1")
+	return strings.HasPrefix(p, "/responses") || strings.HasPrefix(p, "/chat/completions")
 }
 
 // anthropicError 统一错误出口：Anthropic 形状 + Retry-After 头。
