@@ -1,5 +1,6 @@
 # 多阶段构建：静态二进制 + 最小运行镜像
-FROM golang:1.26-alpine AS build
+# 固定到 1.26.10+：CVE-2026-111943（crypto/x509）；浮动的 1.26-alpine 会命中构建缓存里的旧版本
+FROM golang:1.26.10-alpine AS build
 WORKDIR /src
 COPY go.mod ./
 RUN go mod download
